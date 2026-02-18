@@ -436,14 +436,14 @@ class BackupUtils:
             return
 
         try:
-            with open(backup_path, 'rb') as f:
-                file_data = f.read()
+            file_size = os.path.getsize(backup_path)
             handler.send_response(200)
             handler.send_header('Content-Type', 'application/octet-stream')
             handler.send_header('Content-Disposition', f'attachment; filename="{filename}"')
-            handler.send_header('Content-Length', str(len(file_data)))
+            handler.send_header('Content-Length', str(file_size))
             handler.end_headers()
-            handler.wfile.write(file_data)
+            with open(backup_path, 'rb') as f:
+                shutil.copyfileobj(f, handler.wfile)
         except Exception as e:
             self.logger.error(f"Error downloading backup: {e}")
             handler.send_response(500)

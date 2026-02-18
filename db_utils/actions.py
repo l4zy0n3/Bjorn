@@ -162,7 +162,8 @@ class ActionOps:
                         b_rate_limit    = COALESCE(excluded.b_rate_limit, actions.b_rate_limit),
                         b_stealth_level = COALESCE(excluded.b_stealth_level, actions.b_stealth_level),
                         b_risk_level    = COALESCE(excluded.b_risk_level, actions.b_risk_level),
-                        b_enabled       = COALESCE(excluded.b_enabled, actions.b_enabled),
+                        -- Keep persisted enable/disable state from DB across restarts.
+                        b_enabled       = actions.b_enabled,
                         b_args          = COALESCE(excluded.b_args, actions.b_args),
                         b_name          = COALESCE(excluded.b_name, actions.b_name),
                         b_description   = COALESCE(excluded.b_description, actions.b_description),
@@ -218,8 +219,10 @@ class ActionOps:
                         WHERE id = 1
                     """, (action_count_row['cnt'],))
         
+        # Invalidate cache so callers immediately see fresh definitions
+        type(self).get_action_definition.cache_clear()
         logger.info(f"Synchronized {len(actions)} actions")
-    
+
     def list_actions(self):
         """List all action definitions ordered by class name"""
         return self.base.query("SELECT * FROM actions ORDER BY b_class;")
@@ -260,23 +263,6 @@ class ActionOps:
                 "enabled": enabled,
             })
         return out
-    
-    # def list_action_cards(self) -> list[dict]:
-    #     """Lightweight descriptor of actions for card-based UIs"""
-    #     rows = self.base.query("""
-    #         SELECT b_class, b_enabled
-    #         FROM actions
-    #         ORDER BY b_class;
-    #     """)
-    #     out = []
-    #     for r in rows:
-    #         cls = r["b_class"]
-    #         out.append({
-    #             "name": cls,
-    #             "image": f"/actions/actions_icons/{cls}.png",
-    #             "enabled": int(r.get("b_enabled", 1) or 1),
-    #         })
-    #     return out
     
     @lru_cache(maxsize=32)
     def get_action_definition(self, b_class: str) -> Optional[Dict[str, Any]]:

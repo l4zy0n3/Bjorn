@@ -7,8 +7,86 @@ from __future__ import annotations
 import json
 import os
 import ast
-import cgi
 import shutil
+from io import BytesIO
+
+
+# --- Multipart form helpers (replaces cgi module removed in Python 3.13) ---
+def _parse_header(line):
+    parts = line.split(';')
+    key = parts[0].strip()
+    pdict = {}
+    for p in parts[1:]:
+        if '=' in p:
+            k, v = p.strip().split('=', 1)
+            pdict[k.strip()] = v.strip().strip('"')
+    return key, pdict
+
+
+class _FormField:
+    __slots__ = ('name', 'filename', 'file', 'value')
+    def __init__(self, name, filename=None, data=b''):
+        self.name = name
+        self.filename = filename
+        if filename:
+            self.file = BytesIO(data)
+            self.value = data
+        else:
+            self.value = data.decode('utf-8', errors='replace').strip()
+            self.file = None
+
+
+class _MultipartForm:
+    """Minimal replacement for _MultipartForm."""
+    def __init__(self, fp, headers, environ=None, keep_blank_values=False):
+        import re as _re
+        self._fields = {}
+        ct = headers.get('Content-Type', '') if hasattr(headers, 'get') else ''
+        _, params = _parse_header(ct)
+        boundary = params.get('boundary', '').encode()
+        if hasattr(fp, 'read'):
+            cl = headers.get('Content-Length') if hasattr(headers, 'get') else None
+            body = fp.read(int(cl)) if cl else fp.read()
+        else:
+            body = fp
+        for part in body.split(b'--' + boundary)[1:]:
+            part = part.strip(b'\r\n')
+            if part == b'--' or not part:
+                continue
+            sep = b'\r\n\r\n' if b'\r\n\r\n' in part else b'\n\n'
+            if sep not in part:
+                continue
+            hdr, data = part.split(sep, 1)
+            hdr_s = hdr.decode('utf-8', errors='replace')
+            nm = _re.search(r'name="([^"]*)"', hdr_s)
+            fn = _re.search(r'filename="([^"]*)"', hdr_s)
+            if not nm:
+                continue
+            name = nm.group(1)
+            filename = fn.group(1) if fn else None
+            field = _FormField(name, filename, data)
+            if name in self._fields:
+                existing = self._fields[name]
+                if isinstance(existing, list):
+                    existing.append(field)
+                else:
+                    self._fields[name] = [existing, field]
+            else:
+                self._fields[name] = field
+
+    def __contains__(self, key):
+        return key in self._fields
+
+    def __getitem__(self, key):
+        return self._fields[key]
+
+    def getvalue(self, key, default=None):
+        if key not in self._fields:
+            return default
+        f = self._fields[key]
+        if isinstance(f, list):
+            return [x.value for x in f]
+        return f.value
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse, parse_qs
 import logging
@@ -107,7 +185,7 @@ class AttackUtils:
             if 'multipart/form-data' not in ctype:
                 raise ValueError("Content-Type must be multipart/form-data.")
             
-            form = cgi.FieldStorage(fp=handler.rfile, headers=handler.headers, environ={'REQUEST_METHOD': 'POST'})
+            form = _MultipartForm(fp=handler.rfile, headers=handler.headers, environ={'REQUEST_METHOD': 'POST'})
             if 'attack_file' not in form:
                 raise ValueError("No attack_file field in form.")
             

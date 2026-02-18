@@ -1,35 +1,52 @@
-# Advanced password cracker supporting multiple hash formats and attack methods.
-# Saves settings in `/home/bjorn/.settings_bjorn/rune_cracker_settings.json`.
-# Automatically loads saved settings if arguments are not provided.
-# -i, --input       Input file containing hashes to crack.
-# -w, --wordlist    Path to password wordlist (default: built-in list).
-# -r, --rules       Path to rules file for mutations (default: built-in rules).
-# -t, --type        Hash type (md5, sha1, sha256, sha512, ntlm).
-# -o, --output      Output directory (default: /home/bjorn/Bjorn/data/output/hashes).
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+rune_cracker.py -- Advanced password cracker for BJORN.
+Supports multiple hash formats and uses bruteforce_common for progress tracking.
+Optimized for Pi Zero 2 (limited CPU/RAM).
+"""
 
 import os
 import json
 import hashlib
-import argparse
-from datetime import datetime
-import logging
-import threading
-from concurrent.futures import ThreadPoolExecutor
-import itertools
 import re
+import threading
+import time
+from datetime import datetime
 
 
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Set
+
+from logger import Logger
+from actions.bruteforce_common import ProgressTracker, merged_password_plan
+
+logger = Logger(name="rune_cracker.py")
+
+# -------------------- Action metadata --------------------
 b_class       = "RuneCracker"
 b_module      = "rune_cracker"
-b_enabled    = 0
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Default settings
-DEFAULT_OUTPUT_DIR = "/home/bjorn/Bjorn/data/output/hashes"
-DEFAULT_SETTINGS_DIR = "/home/bjorn/.settings_bjorn"
-SETTINGS_FILE = os.path.join(DEFAULT_SETTINGS_DIR, "rune_cracker_settings.json")
+b_status      = "rune_cracker"
+b_port        = None
+b_service     = "[]"
+b_trigger     = "on_start"
+b_parent      = None
+b_action      = "normal"
+b_priority    = 40
+b_cooldown    = 0
+b_rate_limit  = None
+b_timeout     = 600
+b_max_retries = 1
+b_stealth_level = 10  # Local cracking is stealthy
+b_risk_level  = "low"
+b_enabled     = 1
+b_tags        = ["crack", "hash", "bruteforce", "local"]
+b_category    = "exploitation"
+b_name        = "Rune Cracker"
+b_description = "Advanced password cracker with mutation rules and progress tracking."
+b_author      = "Bjorn Team"
+b_version     = "2.1.0"
+b_icon        = "RuneCracker.png"
 
 # Supported hash types and their patterns
 HASH_PATTERNS = {
@@ -40,226 +57,153 @@ HASH_PATTERNS = {
     'ntlm': r'^[a-fA-F0-9]{32}$'
 }
 
+
 class RuneCracker:
-    def __init__(self, input_file, wordlist=None, rules=None, hash_type=None, output_dir=DEFAULT_OUTPUT_DIR):
-        self.input_file = input_file
-        self.wordlist = wordlist
-        self.rules = rules
-        self.hash_type = hash_type
-        self.output_dir = output_dir
-        
-        self.hashes = set()
-        self.cracked = {}
+    def __init__(self, shared_data):
+        self.shared_data = shared_data
+        self.hashes: Set[str] = set()
+        self.cracked: Dict[str, Dict[str, Any]] = {}
         self.lock = threading.Lock()
+        self.hash_type: Optional[str] = None
         
-        # Load mutation rules
-        self.mutation_rules = self.load_rules()
-
-    def load_hashes(self):
-        """Load hashes from input file and validate format."""
-        try:
-            with open(self.input_file, 'r') as f:
-                for line in f:
-                    hash_value = line.strip()
-                    if self.hash_type:
-                        if re.match(HASH_PATTERNS[self.hash_type], hash_value):
-                            self.hashes.add(hash_value)
-                    else:
-                        # Try to auto-detect hash type
-                        for h_type, pattern in HASH_PATTERNS.items():
-                            if re.match(pattern, hash_value):
-                                self.hashes.add(hash_value)
-                                break
-            
-            logging.info(f"Loaded {len(self.hashes)} valid hashes")
-            
-        except Exception as e:
-            logging.error(f"Error loading hashes: {e}")
-
-    def load_wordlist(self):
-        """Load password wordlist."""
-        if self.wordlist and os.path.exists(self.wordlist):
-            with open(self.wordlist, 'r', errors='ignore') as f:
-                return [line.strip() for line in f if line.strip()]
-        return ['password', 'admin', '123456', 'qwerty', 'letmein']
-
-    def load_rules(self):
-        """Load mutation rules."""
-        if self.rules and os.path.exists(self.rules):
-            with open(self.rules, 'r') as f:
-                return [line.strip() for line in f if line.strip() and not line.startswith('#')]
-        return [
-            'capitalize',
-            'lowercase',
-            'uppercase',
-            'l33t',
-            'append_numbers',
-            'prepend_numbers',
-            'toggle_case'
-        ]
-
-    def apply_mutations(self, word):
-        """Apply various mutation rules to a word."""
-        mutations = set([word])
+        # Performance tuning for Pi Zero 2
+        self.max_workers = int(getattr(shared_data, "rune_cracker_workers", 4))
         
-        for rule in self.mutation_rules:
-            if rule == 'capitalize':
-                mutations.add(word.capitalize())
-            elif rule == 'lowercase':
-                mutations.add(word.lower())
-            elif rule == 'uppercase':
-                mutations.add(word.upper())
-            elif rule == 'l33t':
-                mutations.add(word.replace('a', '@').replace('e', '3').replace('i', '1')
-                            .replace('o', '0').replace('s', '5'))
-            elif rule == 'append_numbers':
-                mutations.update(word + str(n) for n in range(100))
-            elif rule == 'prepend_numbers':
-                mutations.update(str(n) + word for n in range(100))
-            elif rule == 'toggle_case':
-                mutations.add(''.join(c.upper() if i % 2 else c.lower() 
-                                   for i, c in enumerate(word)))
-
-        return mutations
-
-    def hash_password(self, password, hash_type):
+    def _hash_password(self, password: str, h_type: str) -> Optional[str]:
         """Generate hash for a password using specified algorithm."""
-        if hash_type == 'md5':
-            return hashlib.md5(password.encode()).hexdigest()
-        elif hash_type == 'sha1':
-            return hashlib.sha1(password.encode()).hexdigest()
-        elif hash_type == 'sha256':
-            return hashlib.sha256(password.encode()).hexdigest()
-        elif hash_type == 'sha512':
-            return hashlib.sha512(password.encode()).hexdigest()
-        elif hash_type == 'ntlm':
-            return hashlib.new('md4', password.encode('utf-16le')).hexdigest()
-        
+        try:
+            if h_type == 'md5':
+                return hashlib.md5(password.encode()).hexdigest()
+            elif h_type == 'sha1':
+                return hashlib.sha1(password.encode()).hexdigest()
+            elif h_type == 'sha256':
+                return hashlib.sha256(password.encode()).hexdigest()
+            elif h_type == 'sha512':
+                return hashlib.sha512(password.encode()).hexdigest()
+            elif h_type == 'ntlm':
+                # NTLM is MD4(UTF-16LE(password))
+                return hashlib.new('md4', password.encode('utf-16le')).hexdigest()
+        except Exception as e:
+            logger.debug(f"Hashing error ({h_type}): {e}")
         return None
 
-    def crack_password(self, password):
-        """Attempt to crack hashes using a single password and its mutations."""
-        try:
-            mutations = self.apply_mutations(password)
-            
-            for mutation in mutations:
-                for hash_type in HASH_PATTERNS.keys():
-                    if not self.hash_type or self.hash_type == hash_type:
-                        hash_value = self.hash_password(mutation, hash_type)
-                        
-                        if hash_value in self.hashes:
-                            with self.lock:
-                                self.cracked[hash_value] = {
-                                    'password': mutation,
-                                    'hash_type': hash_type,
-                                    'timestamp': datetime.now().isoformat()
-                                }
-                                logging.info(f"Cracked hash: {hash_value[:8]}... = {mutation}")
-                                
-        except Exception as e:
-            logging.error(f"Error cracking with password {password}: {e}")
+    def _crack_password_worker(self, password: str, progress: ProgressTracker):
+        """Worker function for cracking passwords."""
+        if self.shared_data.orchestrator_should_exit:
+            return
 
-    def save_results(self):
-        """Save cracked passwords to JSON file."""
-        try:
-            os.makedirs(self.output_dir, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            
-            results = {
-                'timestamp': datetime.now().isoformat(),
-                'total_hashes': len(self.hashes),
-                'cracked_count': len(self.cracked),
-                'cracked_hashes': self.cracked
-            }
-            
-            output_file = os.path.join(self.output_dir, f"cracked_{timestamp}.json")
-            with open(output_file, 'w') as f:
-                json.dump(results, f, indent=4)
+        for h_type in HASH_PATTERNS.keys():
+            if self.hash_type and self.hash_type != h_type:
+                continue
                 
-            logging.info(f"Results saved to {output_file}")
-            
-        except Exception as e:
-            logging.error(f"Failed to save results: {e}")
+            hv = self._hash_password(password, h_type)
+            if hv and hv in self.hashes:
+                with self.lock:
+                    if hv not in self.cracked:
+                        self.cracked[hv] = {
+                            "password": password,
+                            "type": h_type,
+                            "cracked_at": datetime.now().isoformat()
+                        }
+                        logger.success(f"Cracked {h_type}: {hv[:8]}... -> {password}")
+                        self.shared_data.log_milestone(b_class, "Cracked", f"{h_type} found!")
 
-    def execute(self):
-        """Execute the password cracking process."""
+        progress.advance()
+
+    def execute(self, ip, port, row, status_key) -> str:
+        """Standard Orchestrator entry point."""
+        input_file = str(getattr(self.shared_data, "rune_cracker_input", ""))
+        wordlist_path = str(getattr(self.shared_data, "rune_cracker_wordlist", ""))
+        self.hash_type = getattr(self.shared_data, "rune_cracker_type", None)
+        output_dir = getattr(self.shared_data, "rune_cracker_output", "/home/bjorn/Bjorn/data/output/hashes")
+
+        if not input_file or not os.path.exists(input_file):
+            # Fallback: Check for latest odin_recon or other hashes if running in generic mode
+            potential_input = os.path.join(self.shared_data.data_dir, "output", "packets", "latest_hashes.txt")
+            if os.path.exists(potential_input):
+                input_file = potential_input
+                logger.info(f"RuneCracker: No input provided, using fallback: {input_file}")
+            else:
+                logger.error(f"Input file not found: {input_file}")
+                return "failed"
+
+        # Load hashes
+        self.hashes.clear()
         try:
-            logging.info("Starting password cracking process")
-            self.load_hashes()
-            
-            if not self.hashes:
-                logging.error("No valid hashes loaded")
-                return
-            
-            wordlist = self.load_wordlist()
-            
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                executor.map(self.crack_password, wordlist)
-            
-            self.save_results()
-            
-            logging.info(f"Cracking completed. Cracked {len(self.cracked)}/{len(self.hashes)} hashes")
-            
+            with open(input_file, 'r', encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    hv = line.strip()
+                    if not hv: continue
+                    # Auto-detect or validate
+                    for h_t, pat in HASH_PATTERNS.items():
+                        if re.match(pat, hv):
+                            if not self.hash_type or self.hash_type == h_t:
+                                self.hashes.add(hv)
+                                break
         except Exception as e:
-            logging.error(f"Error during execution: {e}")
+            logger.error(f"Error loading hashes: {e}")
+            return "failed"
 
-def save_settings(input_file, wordlist, rules, hash_type, output_dir):
-    """Save settings to JSON file."""
-    try:
-        os.makedirs(DEFAULT_SETTINGS_DIR, exist_ok=True)
-        settings = {
-            "input_file": input_file,
-            "wordlist": wordlist,
-            "rules": rules,
-            "hash_type": hash_type,
-            "output_dir": output_dir
-        }
-        with open(SETTINGS_FILE, 'w') as f:
-            json.dump(settings, f)
-        logging.info(f"Settings saved to {SETTINGS_FILE}")
-    except Exception as e:
-        logging.error(f"Failed to save settings: {e}")
+        if not self.hashes:
+            logger.warning("No valid hashes found in input file.")
+            return "failed"
 
-def load_settings():
-    """Load settings from JSON file."""
-    if os.path.exists(SETTINGS_FILE):
+        logger.info(f"RuneCracker: Loaded {len(self.hashes)} hashes. Starting engine...")
+        self.shared_data.log_milestone(b_class, "Initialization", f"Loaded {len(self.hashes)} hashes")
+
+        # Prepare password plan
+        dict_passwords = []
+        if wordlist_path and os.path.exists(wordlist_path):
+            with open(wordlist_path, 'r', encoding="utf-8", errors="ignore") as f:
+                dict_passwords = [l.strip() for l in f if l.strip()]
+        else:
+            # Fallback tiny list
+            dict_passwords = ['password', 'admin', '123456', 'qwerty', 'bjorn']
+
+        dictionary, fallback = merged_password_plan(self.shared_data, dict_passwords)
+        all_candidates = dictionary + fallback
+        
+        progress = ProgressTracker(self.shared_data, len(all_candidates))
+        self.shared_data.log_milestone(b_class, "Bruteforce", f"Testing {len(all_candidates)} candidates")
+
         try:
-            with open(SETTINGS_FILE, 'r') as f:
-                return json.load(f)
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                for pwd in all_candidates:
+                    if self.shared_data.orchestrator_should_exit:
+                        executor.shutdown(wait=False)
+                        return "interrupted"
+                    executor.submit(self._crack_password_worker, pwd, progress)
         except Exception as e:
-            logging.error(f"Failed to load settings: {e}")
-    return {}
+            logger.error(f"Cracking engine error: {e}")
+            return "failed"
 
-def main():
-    parser = argparse.ArgumentParser(description="Advanced password cracker")
-    parser.add_argument("-i", "--input", help="Input file containing hashes")
-    parser.add_argument("-w", "--wordlist", help="Path to password wordlist")
-    parser.add_argument("-r", "--rules", help="Path to rules file")
-    parser.add_argument("-t", "--type", choices=list(HASH_PATTERNS.keys()), help="Hash type")
-    parser.add_argument("-o", "--output", default=DEFAULT_OUTPUT_DIR, help="Output directory")
-    args = parser.parse_args()
-
-    settings = load_settings()
-    input_file = args.input or settings.get("input_file")
-    wordlist = args.wordlist or settings.get("wordlist")
-    rules = args.rules or settings.get("rules")
-    hash_type = args.type or settings.get("hash_type")
-    output_dir = args.output or settings.get("output_dir")
-
-    if not input_file:
-        logging.error("Input file is required. Use -i or save it in settings")
-        return
-
-    save_settings(input_file, wordlist, rules, hash_type, output_dir)
-
-    cracker = RuneCracker(
-        input_file=input_file,
-        wordlist=wordlist,
-        rules=rules,
-        hash_type=hash_type,
-        output_dir=output_dir
-    )
-    cracker.execute()
+        # Save results
+        if self.cracked:
+            os.makedirs(output_dir, exist_ok=True)
+            out_file = os.path.join(output_dir, f"cracked_{int(time.time())}.json")
+            with open(out_file, 'w', encoding="utf-8") as f:
+                json.dump({
+                    "target_file": input_file,
+                    "total_hashes": len(self.hashes),
+                    "cracked_count": len(self.cracked),
+                    "results": self.cracked
+                }, f, indent=4)
+            logger.success(f"Cracked {len(self.cracked)} hashes! Results: {out_file}")
+            self.shared_data.log_milestone(b_class, "Complete", f"Cracked {len(self.cracked)} hashes")
+            return "success"
+        
+        logger.info("Cracking finished. No matches found.")
+        self.shared_data.log_milestone(b_class, "Finished", "No passwords found")
+        return "success" # Still success even if 0 cracked, as it finished the task
 
 if __name__ == "__main__":
-    main()
+    # Minimal CLI for testing
+    import sys
+    from init_shared import shared_data
+    if len(sys.argv) < 2:
+        print("Usage: rune_cracker.py <hash_file>")
+        sys.exit(1)
+    
+    shared_data.rune_cracker_input = sys.argv[1]
+    cracker = RuneCracker(shared_data)
+    cracker.execute("local", None, {}, "rune_cracker")

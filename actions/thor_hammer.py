@@ -1,214 +1,191 @@
-# Service fingerprinting and version detection tool for vulnerability identification.
-# Saves settings in `/home/bjorn/.settings_bjorn/thor_hammer_settings.json`.
-# Automatically loads saved settings if arguments are not provided.
-# -t, --target       Target IP or hostname to scan (overrides saved value).
-# -p, --ports        Ports to scan (default: common ports, comma-separated).
-# -o, --output       Output directory (default: /home/bjorn/Bjorn/data/output/services).
-# -d, --delay        Delay between probes in seconds (default: 1).
-# -v, --verbose      Enable verbose output for detailed service information.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+thor_hammer.py — Service fingerprinting (Pi Zero friendly, orchestrator compatible).
 
-import os
-import json
-import socket
-import argparse
-import threading
-from datetime import datetime
+What it does:
+- For a given target (ip, port), tries a fast TCP connect + banner grab.
+- Optionally stores a service fingerprint into DB.port_services via db.upsert_port_service.
+- Updates EPD fields: bjorn_orch_status, bjorn_status_text2, comment_params, bjorn_progress.
+
+Notes:
+- Avoids spawning nmap per-port (too heavy). If you want nmap, add a dedicated action.
+"""
+
 import logging
-from concurrent.futures import ThreadPoolExecutor
-import subprocess
+import socket
+import time
+from typing import Dict, Optional, Tuple
+
+from logger import Logger
+from actions.bruteforce_common import ProgressTracker
+
+logger = Logger(name="thor_hammer.py", level=logging.DEBUG)
+
+# -------------------- Action metadata (AST-friendly) --------------------
+b_class = "ThorHammer"
+b_module = "thor_hammer"
+b_status = "ThorHammer"
+b_port = None
+b_parent = None
+b_service = '["ssh","ftp","telnet","http","https","smb","mysql","postgres","mssql","rdp","vnc"]'
+b_trigger = "on_port_change"
+b_priority = 35
+b_action = "normal"
+b_cooldown = 1200
+b_rate_limit = "24/86400"
+b_enabled = 0  # keep disabled by default; enable via Actions UI/DB when ready.
 
 
+def _guess_service_from_port(port: int) -> str:
+    mapping = {
+        21: "ftp",
+        22: "ssh",
+        23: "telnet",
+        25: "smtp",
+        53: "dns",
+        80: "http",
+        110: "pop3",
+        139: "netbios-ssn",
+        143: "imap",
+        443: "https",
+        445: "smb",
+        1433: "mssql",
+        3306: "mysql",
+        3389: "rdp",
+        5432: "postgres",
+        5900: "vnc",
+        8080: "http",
+    }
+    return mapping.get(int(port), "")
 
-
-
-b_class       = "ThorHammer"
-b_module      = "thor_hammer"
-b_enabled    = 0
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Default settings
-DEFAULT_OUTPUT_DIR = "/home/bjorn/Bjorn/data/output/services"
-DEFAULT_SETTINGS_DIR = "/home/bjorn/.settings_bjorn"
-SETTINGS_FILE = os.path.join(DEFAULT_SETTINGS_DIR, "thor_hammer_settings.json")
-DEFAULT_PORTS = [21, 22, 23, 25, 53, 80, 110, 115, 139, 143, 194, 443, 445, 1433, 3306, 3389, 5432, 5900, 8080]
-
-# Service signature database
-SERVICE_SIGNATURES = {
-    21: {
-        'name': 'FTP',
-        'vulnerabilities': {
-            'vsftpd 2.3.4': 'Backdoor command execution',
-            'ProFTPD 1.3.3c': 'Remote code execution'
-        }
-    },
-    22: {
-        'name': 'SSH',
-        'vulnerabilities': {
-            'OpenSSH 5.3': 'Username enumeration',
-            'OpenSSH 7.2p1': 'User enumeration timing attack'
-        }
-    },
-    # Add more signatures as needed
-}
 
 class ThorHammer:
-    def __init__(self, target, ports=None, output_dir=DEFAULT_OUTPUT_DIR, delay=1, verbose=False):
-        self.target = target
-        self.ports = ports or DEFAULT_PORTS
-        self.output_dir = output_dir
-        self.delay = delay
-        self.verbose = verbose
-        self.results = {
-            'target': target,
-            'timestamp': datetime.now().isoformat(),
-            'services': {}
-        }
-        self.lock = threading.Lock()
+    def __init__(self, shared_data):
+        self.shared_data = shared_data
 
-    def probe_service(self, port):
-        """Probe a specific port for service information."""
+    def _connect_and_banner(self, ip: str, port: int, timeout_s: float, max_bytes: int) -> Tuple[bool, str]:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout_s)
         try:
-            # Initial connection test
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(self.delay)
-            result = sock.connect_ex((self.target, port))
-            
-            if result == 0:
-                service_info = {
-                    'port': port,
-                    'state': 'open',
-                    'service': None,
-                    'version': None,
-                    'vulnerabilities': []
+            if s.connect_ex((ip, int(port))) != 0:
+                return False, ""
+            try:
+                data = s.recv(max_bytes)
+                banner = (data or b"").decode("utf-8", errors="ignore").strip()
+            except Exception:
+                banner = ""
+            return True, banner
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+    def execute(self, ip, port, row, status_key) -> str:
+        if self.shared_data.orchestrator_should_exit:
+            return "interrupted"
+
+        try:
+            port_i = int(port) if str(port).strip() else None
+        except Exception:
+            port_i = None
+
+        # If port is missing, try to infer from row 'Ports' and fingerprint a few.
+        ports_to_check = []
+        if port_i:
+            ports_to_check = [port_i]
+        else:
+            ports_txt = str(row.get("Ports") or row.get("ports") or "")
+            for p in ports_txt.split(";"):
+                p = p.strip()
+                if p.isdigit():
+                    ports_to_check.append(int(p))
+            ports_to_check = ports_to_check[:12]  # Pi Zero guard
+
+        if not ports_to_check:
+            return "failed"
+
+        timeout_s = float(getattr(self.shared_data, "thor_connect_timeout_s", 1.5))
+        max_bytes = int(getattr(self.shared_data, "thor_banner_max_bytes", 1024))
+        source = str(getattr(self.shared_data, "thor_source", "thor_hammer"))
+
+        mac = (row.get("MAC Address") or row.get("mac_address") or row.get("mac") or "").strip()
+        hostname = (row.get("Hostname") or row.get("hostname") or "").strip()
+        if ";" in hostname:
+            hostname = hostname.split(";", 1)[0].strip()
+
+        self.shared_data.bjorn_orch_status = "ThorHammer"
+        self.shared_data.bjorn_status_text2 = ip
+        self.shared_data.comment_params = {"ip": ip, "port": str(ports_to_check[0])}
+
+        progress = ProgressTracker(self.shared_data, len(ports_to_check))
+
+        try:
+            any_open = False
+            for p in ports_to_check:
+                if self.shared_data.orchestrator_should_exit:
+                    return "interrupted"
+
+                ok, banner = self._connect_and_banner(ip, p, timeout_s=timeout_s, max_bytes=max_bytes)
+                any_open = any_open or ok
+
+                service = _guess_service_from_port(p)
+                product = ""
+                version = ""
+                fingerprint = banner[:200] if banner else ""
+                confidence = 0.4 if ok else 0.1
+                state = "open" if ok else "closed"
+
+                self.shared_data.comment_params = {
+                    "ip": ip,
+                    "port": str(p),
+                    "open": str(int(ok)),
+                    "svc": service or "?",
                 }
 
-                # Get service banner
+                # Persist to DB if method exists.
                 try:
-                    banner = sock.recv(1024).decode('utf-8', errors='ignore').strip()
-                    service_info['banner'] = banner
-                except:
-                    service_info['banner'] = None
+                    if hasattr(self.shared_data, "db") and hasattr(self.shared_data.db, "upsert_port_service"):
+                        self.shared_data.db.upsert_port_service(
+                            mac_address=mac or "",
+                            ip=ip,
+                            port=int(p),
+                            protocol="tcp",
+                            state=state,
+                            service=service or None,
+                            product=product or None,
+                            version=version or None,
+                            banner=banner or None,
+                            fingerprint=fingerprint or None,
+                            confidence=float(confidence),
+                            source=source,
+                        )
+                except Exception as e:
+                    logger.error(f"DB upsert_port_service failed for {ip}:{p}: {e}")
 
-                # Advanced service detection using nmap if available
-                try:
-                    nmap_output = subprocess.check_output(
-                        ['nmap', '-sV', '-p', str(port), '-T4', self.target],
-                        stderr=subprocess.DEVNULL
-                    ).decode()
-                    
-                    # Parse nmap output
-                    for line in nmap_output.split('\n'):
-                        if str(port) in line and 'open' in line:
-                            service_info['service'] = line.split()[2]
-                            if len(line.split()) > 3:
-                                service_info['version'] = ' '.join(line.split()[3:])
-                except:
-                    pass
+                progress.advance(1)
 
-                # Check for known vulnerabilities
-                if port in SERVICE_SIGNATURES:
-                    sig = SERVICE_SIGNATURES[port]
-                    service_info['service'] = service_info['service'] or sig['name']
-                    if service_info['version']:
-                        for vuln_version, vuln_desc in sig['vulnerabilities'].items():
-                            if vuln_version.lower() in service_info['version'].lower():
-                                service_info['vulnerabilities'].append({
-                                    'version': vuln_version,
-                                    'description': vuln_desc
-                                })
+            progress.set_complete()
+            return "success" if any_open else "failed"
+        finally:
+            self.shared_data.bjorn_progress = ""
+            self.shared_data.comment_params = {}
+            self.shared_data.bjorn_status_text2 = ""
 
-                with self.lock:
-                    self.results['services'][port] = service_info
-                    if self.verbose:
-                        logging.info(f"Service detected on port {port}: {service_info['service']}")
 
-            sock.close()
+# -------------------- Optional CLI (debug/manual) --------------------
+if __name__ == "__main__":
+    import argparse
+    from shared import SharedData
 
-        except Exception as e:
-            logging.error(f"Error probing port {port}: {e}")
-
-    def save_results(self):
-        """Save scan results to a JSON file."""
-        try:
-            os.makedirs(self.output_dir, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            filename = os.path.join(self.output_dir, f"service_scan_{timestamp}.json")
-            
-            with open(filename, 'w') as f:
-                json.dump(self.results, f, indent=4)
-            logging.info(f"Results saved to {filename}")
-        except Exception as e:
-            logging.error(f"Failed to save results: {e}")
-
-    def execute(self):
-        """Execute the service scanning and fingerprinting process."""
-        logging.info(f"Starting service scan on {self.target}")
-        
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            executor.map(self.probe_service, self.ports)
-        
-        self.save_results()
-        return self.results
-
-def save_settings(target, ports, output_dir, delay, verbose):
-    """Save settings to JSON file."""
-    try:
-        os.makedirs(DEFAULT_SETTINGS_DIR, exist_ok=True)
-        settings = {
-            "target": target,
-            "ports": ports,
-            "output_dir": output_dir,
-            "delay": delay,
-            "verbose": verbose
-        }
-        with open(SETTINGS_FILE, 'w') as f:
-            json.dump(settings, f)
-        logging.info(f"Settings saved to {SETTINGS_FILE}")
-    except Exception as e:
-        logging.error(f"Failed to save settings: {e}")
-
-def load_settings():
-    """Load settings from JSON file."""
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logging.error(f"Failed to load settings: {e}")
-    return {}
-
-def main():
-    parser = argparse.ArgumentParser(description="Service fingerprinting and vulnerability detection tool")
-    parser.add_argument("-t", "--target", help="Target IP or hostname")
-    parser.add_argument("-p", "--ports", help="Ports to scan (comma-separated)")
-    parser.add_argument("-o", "--output", default=DEFAULT_OUTPUT_DIR, help="Output directory")
-    parser.add_argument("-d", "--delay", type=float, default=1, help="Delay between probes")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
+    parser = argparse.ArgumentParser(description="ThorHammer (service fingerprint)")
+    parser.add_argument("--ip", required=True)
+    parser.add_argument("--port", default="22")
     args = parser.parse_args()
 
-    settings = load_settings()
-    target = args.target or settings.get("target")
-    ports = [int(p) for p in args.ports.split(',')] if args.ports else settings.get("ports", DEFAULT_PORTS)
-    output_dir = args.output or settings.get("output_dir")
-    delay = args.delay or settings.get("delay")
-    verbose = args.verbose or settings.get("verbose")
+    sd = SharedData()
+    act = ThorHammer(sd)
+    row = {"MAC Address": sd.get_raspberry_mac() or "__GLOBAL__", "Hostname": "", "Ports": args.port}
+    print(act.execute(args.ip, args.port, row, "ThorHammer"))
 
-    if not target:
-        logging.error("Target is required. Use -t or save it in settings")
-        return
-
-    save_settings(target, ports, output_dir, delay, verbose)
-
-    scanner = ThorHammer(
-        target=target,
-        ports=ports,
-        output_dir=output_dir,
-        delay=delay,
-        verbose=verbose
-    )
-    scanner.execute()
-
-if __name__ == "__main__":
-    main()

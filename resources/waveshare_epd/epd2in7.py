@@ -28,7 +28,9 @@
 #
 
 import logging
+import time
 from . import epdconfig
+from logger import Logger
 
 # Display resolution
 EPD_WIDTH       = 176
@@ -39,11 +41,18 @@ GRAY2  = 0xC0
 GRAY3  = 0x80 #gray
 GRAY4  = 0x00 #Blackest
 
-logger = logging.getLogger(__name__)
+logger = Logger(name="epd2in7.py", level=logging.DEBUG)
 
 class EPD:
     def __init__(self):
         self.is_initialized = False  # New flag to track if the display has been initialized #INFINITION
+        # Diagnostic guards for BUSY wait loops:
+        # this prevents a permanent block when BUSY pin gets stuck.
+        self.busy_timeout_s = 45.0
+        self.busy_poll_ms = 200
+        self.busy_log_interval_s = 5.0
+        # Keep this False in production to avoid log spam on normal refresh cycles.
+        self.log_busy_transitions = False
         self.reset_pin = epdconfig.RST_PIN
         self.dc_pin = epdconfig.DC_PIN
         self.busy_pin = epdconfig.BUSY_PIN
@@ -174,11 +183,29 @@ class EPD:
         epdconfig.spi_writebyte([data])
         epdconfig.digital_write(self.cs_pin, 1)
         
-    def ReadBusy(self):        
-        logger.debug("e-Paper busy")
-        while(epdconfig.digital_read(self.busy_pin) == 0):      #  0: idle, 1: busy
-            epdconfig.delay_ms(200)                
-        logger.debug("e-Paper busy release")
+    def ReadBusy(self):
+        # epd2in7 uses inverted BUSY logic on this implementation:
+        # 0 = busy, 1 = idle.
+        if self.log_busy_transitions:
+            logger.debug("e-Paper busy")
+        started = time.monotonic()
+        last_log = started
+        while(epdconfig.digital_read(self.busy_pin) == 0):
+            now = time.monotonic()
+            waited = now - started
+            if waited >= self.busy_timeout_s:
+                raise TimeoutError(
+                    f"EPD busy timeout after {self.busy_timeout_s:.1f}s "
+                    f"(pin={self.busy_pin}, state=0, expected idle=1)"
+                )
+            if (now - last_log) >= self.busy_log_interval_s:
+                logger.warning(
+                    f"ReadBusy waiting {waited:.1f}s (pin={self.busy_pin}, state=0/busy)"
+                )
+                last_log = now
+            epdconfig.delay_ms(self.busy_poll_ms)
+        if self.log_busy_transitions:
+            logger.debug("e-Paper busy release")
 
     def set_lut(self):
         self.send_command(0x20) # vcom
@@ -524,4 +551,3 @@ class EPD:
         epdconfig.delay_ms(2000)
         epdconfig.module_exit()
 ### END OF FILE ###
-

@@ -213,48 +213,32 @@ class IndexUtils:
                 return ts
         except Exception:
             pass
-        ts = int(time.time())
-        self._cfg_set("first_init_ts", ts)
-        return ts
-
-    # ---------------------- Monitoring ressources ----------------------
-    def _cpu_pct(self) -> int:
-        try:
-            return int(psutil.cpu_percent(interval=0.5))
-        except Exception:
-            return 0
-
-    def _mem_bytes(self) -> Tuple[int, int]:
-        try:
-            vm = psutil.virtual_memory()
-            return int(vm.total - vm.available), int(vm.total)
-        except Exception:
-            try:
-                info = self._read_text("/proc/meminfo") or ""
-                def kb(k):
-                    line = next((l for l in info.splitlines() if l.startswith(k + ":")), None)
-                    return int(line.split()[1]) * 1024 if line else 0
-                total = kb("MemTotal")
-                free = kb("MemFree") + kb("Buffers") + kb("Cached")
-                used = max(0, total - free)
-                return used, total
-            except Exception:
-                return 0, 0
-
-    def _disk_bytes(self) -> Tuple[int, int]:
-        try:
-            usage = psutil.disk_usage("/")
-            return int(usage.used), int(usage.total)
-        except Exception:
-            try:
-                st = os.statvfs("/")
-                total = st.f_frsize * st.f_blocks
-                free = st.f_frsize * st.f_bavail
-                return int(total - free), int(total)
-            except Exception:
-                return 0, 0
+        return 0
 
     def _battery_probe(self) -> Dict[str, Any]:
+        try:
+            # Prefer runtime battery telemetry (PiSugar/shared_data) when available.
+            present = bool(getattr(self.shared_data, "battery_present", False))
+            last_update = float(getattr(self.shared_data, "battery_last_update", 0.0))
+            source = str(getattr(self.shared_data, "battery_source", "shared"))
+            if last_update > 0 and (present or source == "none"):
+                level = int(getattr(self.shared_data, "battery_percent", 0))
+                charging = bool(getattr(self.shared_data, "battery_is_charging", False))
+                state = "Charging" if charging else "Discharging"
+                if not present:
+                    state = "No battery"
+                return {
+                    "present": present,
+                    "level_pct": max(0, min(100, level)),
+                    "state": state,
+                    "charging": charging,
+                    "voltage": getattr(self.shared_data, "battery_voltage", None),
+                    "source": source,
+                    "updated_at": last_update,
+                }
+        except Exception:
+            pass
+
         base = "/sys/class/power_supply"
         try:
             if not os.path.isdir(base):
@@ -414,11 +398,53 @@ class IndexUtils:
         except Exception:
             return 0
 
+    def _cpu_pct(self) -> int:
+        # OPTIMIZATION: Use shared_data from display loop to avoid blocking 0.5s
+        # Old method:
+        # try:
+        #     return int(psutil.cpu_percent(interval=0.5))
+        # except Exception:
+        #     return 0
+        return int(getattr(self.shared_data, "system_cpu", 0))
+
+    def _mem_bytes(self) -> Tuple[int, int]:
+        # OPTIMIZATION: Use shared_data from display loop
+        # Old method:
+        # try:
+        #     vm = psutil.virtual_memory()
+        #     return int(vm.total - vm.available), int(vm.total)
+        # except Exception:
+        #     try:
+        #         info = self._read_text("/proc/meminfo") or ""
+        #         def kb(k):
+        #             line = next((l for l in info.splitlines() if l.startswith(k + ":")), None)
+        #             return int(line.split()[1]) * 1024 if line else 0
+        #         total = kb("MemTotal")
+        #         free = kb("MemFree") + kb("Buffers") + kb("Cached")
+        #         used = max(0, total - free)
+        #         return used, total
+        #     except Exception:
+        #         return 0, 0
+        return int(getattr(self.shared_data, "system_mem_used", 0)), int(getattr(self.shared_data, "system_mem_total", 0))
+
+    def _disk_bytes(self) -> Tuple[int, int]:
+        try:
+            usage = psutil.disk_usage("/")
+            return int(usage.used), int(usage.total)
+        except Exception:
+            try:
+                st = os.statvfs("/")
+                total = st.f_frsize * st.f_blocks
+                free = st.f_frsize * st.f_bavail
+                return int(total - free), int(total)
+            except Exception:
+                return 0, 0
+
     def _alive_hosts_db(self) -> Tuple[int, int]:
         try:
             row = self.db.query_one(
                 """
-                SELECT 
+                SELECT
                     SUM(CASE WHEN alive=1 THEN 1 ELSE 0 END) AS alive,
                     COUNT(*) AS total
                 FROM hosts
@@ -462,7 +488,7 @@ class IndexUtils:
 
     def _zombies_count_db(self) -> int:
         try:
-            row = self.db.query_one("SELECT COUNT(*) AS c FROM stats WHERE id=1;")
+            row = self.db.query_one("SELECT COALESCE(zombie_count, 0) AS c FROM stats WHERE id=1;")
             if row and row.get("c") is not None:
                 return int(row["c"])
         except Exception:

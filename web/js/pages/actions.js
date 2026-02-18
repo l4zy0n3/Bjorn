@@ -1,0 +1,817 @@
+﻿/**
+ * Actions page (SPA) — old actions_launcher parity.
+ * Sidebar (actions/arguments) + multi-console panes.
+ */
+import { ResourceTracker } from '../core/resource-tracker.js';
+import { api } from '../core/api.js';
+import { el, $, $$, empty, toast } from '../core/dom.js';
+import { t } from '../core/i18n.js';
+import { initSharedSidebarLayout } from '../core/sidebar-layout.js';
+
+const PAGE = 'actions';
+
+let tracker = null;
+let root = null;
+let sidebarLayoutCleanup = null;
+
+let actions = [];
+let activeActionId = null;
+let panes = [null, null, null, null];
+let split = 1;
+let assignTargetPaneIndex = null;
+let searchQuery = '';
+let currentTab = 'actions';
+
+const logsByAction = new Map(); // actionId -> string[]
+const pollingTimers = new Map(); // actionId -> timeoutId
+const autoClearPane = [false, false, false, false];
+
+function tx(key, fallback) {
+  const v = t(key);
+  return v === key ? fallback : v;
+}
+
+function isMobile() {
+  return window.matchMedia('(max-width: 860px)').matches;
+}
+
+function q(sel, base = root) { return base?.querySelector(sel) || null; }
+
+export async function mount(container) {
+  tracker = new ResourceTracker(PAGE);
+  root = buildShell();
+  container.appendChild(root);
+  sidebarLayoutCleanup = initSharedSidebarLayout(root, {
+    sidebarSelector: '.al-sidebar',
+    mainSelector: '#actionsLauncher',
+    storageKey: 'sidebar:actions',
+    toggleLabel: tx('common.menu', 'Menu'),
+  });
+
+  bindStaticEvents();
+  enforceMobileOnePane();
+
+  await loadActions();
+  renderActionsList();
+  renderConsoles();
+}
+
+export function unmount() {
+  if (typeof sidebarLayoutCleanup === 'function') {
+    sidebarLayoutCleanup();
+    sidebarLayoutCleanup = null;
+  }
+
+  for (const tmr of pollingTimers.values()) clearTimeout(tmr);
+  pollingTimers.clear();
+
+  if (tracker) {
+    tracker.cleanupAll();
+    tracker = null;
+  }
+
+  root = null;
+  actions = [];
+  activeActionId = null;
+  panes = [null, null, null, null];
+  split = 1;
+  assignTargetPaneIndex = null;
+  searchQuery = '';
+  currentTab = 'actions';
+  logsByAction.clear();
+}
+
+function buildShell() {
+  const sideTabs = el('div', { class: 'tabs-container' }, [
+    el('button', { class: 'tab-btn active', id: 'tabBtnActions', type: 'button' }, [tx('actions.tabs.actions', 'Actions')]),
+    el('button', { class: 'tab-btn', id: 'tabBtnArgs', type: 'button' }, [tx('actions.tabs.arguments', 'Arguments')]),
+  ]);
+
+  const sideHeader = el('div', { class: 'sideheader' }, [
+    el('div', { class: 'al-side-meta' }, [
+      el('div', { class: 'sidetitle' }, [tx('nav.actions', 'Actions')]),
+      el('button', { class: 'al-btn', id: 'hideSidebar', 'data-hide-sidebar': '1', type: 'button' }, [tx('common.hide', 'Hide')]),
+    ]),
+    sideTabs,
+    el('div', { class: 'al-search' }, [
+      el('input', {
+        id: 'searchInput',
+        class: 'al-input',
+        type: 'text',
+        placeholder: tx('actions.searchPlaceholder', 'Search actions...'),
+      }),
+    ]),
+  ]);
+
+  const actionsSidebar = el('div', { id: 'tab-actions', class: 'sidebar-page' }, [
+    el('div', { id: 'actionsList', class: 'al-list' }),
+  ]);
+
+  const argsSidebar = el('div', { id: 'tab-arguments', class: 'sidebar-page', style: 'display:none' }, [
+    el('div', { class: 'section' }, [
+      el('div', { class: 'h' }, [tx('actions.args.title', 'Arguments')]),
+      el('div', { class: 'sub' }, [tx('actions.args.subtitle', 'Auto-generated from action definitions')]),
+    ]),
+    el('div', { id: 'argBuilder', class: 'builder' }),
+    el('div', { class: 'section' }, [
+      el('input', {
+        id: 'freeArgs',
+        class: 'ctl',
+        type: 'text',
+        placeholder: tx('actions.args.free', 'Additional arguments (e.g., --verbose --debug)'),
+      }),
+    ]),
+    el('div', { id: 'presetChips', class: 'chips' }),
+  ]);
+
+  const sideContent = el('div', { class: 'sidecontent' }, [actionsSidebar, argsSidebar]);
+
+  const sidebarPanel = el('aside', { class: 'panel al-sidebar' }, [sideHeader, sideContent]);
+
+  const splitSeg = el('div', { class: 'seg', id: 'splitSeg' }, [
+    el('button', { type: 'button', 'data-split': '1', class: 'active' }, ['1']),
+    el('button', { type: 'button', 'data-split': '2' }, ['2']),
+    el('button', { type: 'button', 'data-split': '3' }, ['3']),
+    el('button', { type: 'button', 'data-split': '4' }, ['4']),
+  ]);
+
+  const toolbar = el('div', { class: 'toolbar2' }, [
+    el('div', { class: 'spacer' }),
+    splitSeg,
+  ]);
+
+  const multiConsole = el('div', { class: 'multiConsole split-1', id: 'multiConsole' });
+
+  const centerPanel = el('section', { class: 'center panel' }, [toolbar, multiConsole]);
+
+  return el('div', { class: 'actions-container page-with-sidebar' }, [
+    sidebarPanel,
+    el('main', { id: 'actionsLauncher' }, [centerPanel]),
+  ]);
+}
+
+function bindStaticEvents() {
+  const tabActions = q('#tabBtnActions');
+  const tabArgs = q('#tabBtnArgs');
+
+  if (tabActions) tracker.trackEventListener(tabActions, 'click', () => switchTab('actions'));
+  if (tabArgs) tracker.trackEventListener(tabArgs, 'click', () => switchTab('arguments'));
+
+  const searchInput = q('#searchInput');
+  if (searchInput) {
+    tracker.trackEventListener(searchInput, 'input', () => {
+      searchQuery = String(searchInput.value || '').trim().toLowerCase();
+      renderActionsList();
+    });
+  }
+
+  $$('#splitSeg button', root).forEach((btn) => {
+    tracker.trackEventListener(btn, 'click', () => {
+      if (isMobile()) {
+        enforceMobileOnePane();
+        return;
+      }
+      split = Number(btn.dataset.split || '1');
+      $$('#splitSeg button', root).forEach((b) => b.classList.toggle('active', b === btn));
+      renderConsoles();
+    });
+  });
+
+  tracker.trackEventListener(window, 'resize', onResizeDebounced);
+}
+
+function onResizeDebounced() {
+  clearTimeout(onResizeDebounced._t);
+  onResizeDebounced._t = setTimeout(() => {
+    enforceMobileOnePane();
+    renderConsoles();
+  }, 120);
+}
+
+function switchTab(tab) {
+  currentTab = tab;
+  const tabActions = q('#tabBtnActions');
+  const tabArgs = q('#tabBtnArgs');
+  const actionsPane = q('#tab-actions');
+  const argsPane = q('#tab-arguments');
+
+  if (tabActions) tabActions.classList.toggle('active', tab === 'actions');
+  if (tabArgs) tabArgs.classList.toggle('active', tab === 'arguments');
+  if (actionsPane) actionsPane.style.display = tab === 'actions' ? '' : 'none';
+  if (argsPane) argsPane.style.display = tab === 'arguments' ? '' : 'none';
+}
+
+function enforceMobileOnePane() {
+  if (!isMobile()) {
+    $$('#splitSeg button', root).forEach((btn) => {
+      btn.disabled = false;
+      btn.style.opacity = '';
+      btn.style.pointerEvents = '';
+    });
+    return;
+  }
+
+  split = 1;
+  if (!panes[0] && activeActionId) panes[0] = activeActionId;
+  for (let i = 1; i < panes.length; i++) panes[i] = null;
+
+  $$('#splitSeg button', root).forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.split === '1');
+    btn.disabled = true;
+    btn.style.opacity = '0.6';
+    btn.style.pointerEvents = 'none';
+  });
+}
+
+async function loadActions() {
+  try {
+    const response = await api.get('/list_scripts', { timeout: 12000, retries: 1 });
+    const list = Array.isArray(response?.data) ? response.data : [];
+
+    const prev = new Map(actions.map((a) => [a.id, a.status]));
+
+    actions = list.map((raw) => normalizeAction(raw));
+    actions.forEach((a) => {
+      a.status = prev.get(a.id) || (a.is_running ? 'running' : 'ready');
+      if (!logsByAction.has(a.id)) logsByAction.set(a.id, []);
+    });
+
+    if (activeActionId && !actions.some((a) => a.id === activeActionId)) {
+      activeActionId = null;
+      empty(q('#argBuilder'));
+      empty(q('#presetChips'));
+    }
+  } catch (err) {
+    toast(`${tx('common.error', 'Error')}: ${err.message}`, 2600, 'error');
+    actions = [];
+  }
+}
+
+function normalizeAction(raw) {
+  const id = raw.b_module || (raw.name ? raw.name.replace(/\.py$/, '') : 'unknown');
+
+  let args = raw.b_args ?? {};
+  if (typeof args === 'string') {
+    try { args = JSON.parse(args); } catch { args = {}; }
+  }
+
+  let examples = raw.b_examples;
+  if (typeof examples === 'string') {
+    try { examples = JSON.parse(examples); } catch { examples = []; }
+  }
+  if (!Array.isArray(examples)) examples = [];
+
+  return {
+    id,
+    name: raw.name || raw.b_class || raw.b_module || 'Unnamed',
+    module: raw.b_module || raw.module || id,
+    bClass: raw.b_class || id,
+    category: (raw.b_action || raw.category || 'normal').toLowerCase(),
+    description: raw.description || tx('actions.description', 'Description'),
+    args,
+    icon: raw.b_icon || `/actions_icons/${encodeURIComponent(raw.b_class || id)}.png`,
+    version: raw.b_version || '',
+    author: raw.b_author || '',
+    docsUrl: raw.b_docs_url || '',
+    examples,
+    path: raw.path || raw.module_path || raw.b_module || id,
+    is_running: !!raw.is_running,
+    status: raw.is_running ? 'running' : 'ready',
+  };
+}
+
+function renderActionsList() {
+  const container = q('#actionsList');
+  if (!container) return;
+  empty(container);
+
+  const filtered = actions.filter((a) => {
+    if (!searchQuery) return true;
+    const hay = `${a.name} ${a.description} ${a.module} ${a.id} ${a.author} ${a.category}`.toLowerCase();
+    return searchQuery.split(/\s+/).every((term) => hay.includes(term));
+  });
+
+  if (!filtered.length) {
+    container.appendChild(el('div', { class: 'sub' }, [tx('actions.noActions', 'No actions found')]));
+    return;
+  }
+
+  for (const a of filtered) {
+    const row = el('div', { class: `al-row${a.id === activeActionId ? ' selected' : ''}`, draggable: 'true', 'data-action-id': a.id }, [
+      el('div', { class: 'ic' }, [
+        el('img', {
+          class: 'ic-img',
+          src: a.icon,
+          alt: '',
+          onerror: (e) => {
+            e.target.onerror = null;
+            e.target.src = '/actions/actions_icons/default.png';
+          },
+        }),
+      ]),
+      el('div', {}, [
+        el('div', { class: 'name' }, [a.name]),
+        el('div', { class: 'desc' }, [a.description]),
+      ]),
+      el('div', { class: `chip ${statusChipClass(a.status)}` }, [statusChipText(a.status)]),
+    ]);
+
+    tracker.trackEventListener(row, 'click', () => onActionSelected(a.id));
+    tracker.trackEventListener(row, 'dragstart', (ev) => {
+      ev.dataTransfer?.setData('text/plain', a.id);
+    });
+
+    container.appendChild(row);
+  }
+}
+
+function statusChipClass(status) {
+  if (status === 'running') return 'run';
+  if (status === 'success') return 'ok';
+  if (status === 'error') return 'err';
+  return '';
+}
+
+function statusChipText(status) {
+  if (status === 'running') return tx('actions.running', 'Running');
+  if (status === 'success') return tx('common.success', 'Success');
+  if (status === 'error') return tx('common.error', 'Error');
+  return tx('common.ready', 'Ready');
+}
+
+function onActionSelected(actionId) {
+  activeActionId = actionId;
+  const action = actions.find((a) => a.id === actionId);
+  if (!action) return;
+
+  renderActionsList();
+  renderArguments(action);
+
+  if (assignTargetPaneIndex != null) {
+    panes[assignTargetPaneIndex] = actionId;
+    clearAssignTarget();
+    renderConsoles();
+    return;
+  }
+
+  const existing = panes.findIndex((id) => id === actionId);
+  if (existing >= 0) {
+    highlightPane(existing);
+    return;
+  }
+
+  const effectiveSplit = isMobile() ? 1 : split;
+  let target = panes.slice(0, effectiveSplit).findIndex((id) => !id);
+  if (target < 0) target = 0;
+  panes[target] = actionId;
+  renderConsoles();
+}
+
+function renderArguments(action) {
+  switchTab('arguments');
+
+  const builder = q('#argBuilder');
+  const chips = q('#presetChips');
+  if (!builder || !chips) return;
+  empty(builder);
+  empty(chips);
+
+  const metaBits = [];
+  if (action.version) metaBits.push(`v${action.version}`);
+  if (action.author) metaBits.push(`by ${action.author}`);
+
+  if (metaBits.length || action.docsUrl) {
+    const top = el('div', { style: 'display:flex;justify-content:space-between;gap:8px;align-items:center' }, [
+      el('div', { class: 'sub' }, [metaBits.join(' • ')]),
+      action.docsUrl
+        ? el('a', { class: 'al-btn', href: action.docsUrl, target: '_blank', rel: 'noopener noreferrer' }, ['Docs'])
+        : null,
+    ]);
+    builder.appendChild(top);
+  }
+
+  const entries = Object.entries(action.args || {});
+  if (!entries.length) {
+    builder.appendChild(el('div', { class: 'sub' }, [tx('actions.args.none', 'No configurable arguments')]));
+  }
+
+  for (const [key, cfgRaw] of entries) {
+    const cfg = cfgRaw && typeof cfgRaw === 'object' ? cfgRaw : { type: 'text', default: cfgRaw };
+
+    const field = el('div', { class: 'field' }, [
+      el('div', { class: 'label' }, [cfg.label || key]),
+      createArgControl(key, cfg),
+      cfg.help ? el('div', { class: 'sub' }, [cfg.help]) : null,
+    ]);
+    builder.appendChild(field);
+  }
+
+  const presets = Array.isArray(action.examples) ? action.examples : [];
+  for (let i = 0; i < presets.length; i++) {
+    const p = presets[i];
+    const label = p.name || p.title || `Preset ${i + 1}`;
+    const btn = el('button', { class: 'chip2', type: 'button' }, [label]);
+    tracker.trackEventListener(btn, 'click', () => applyPreset(p));
+    chips.appendChild(btn);
+  }
+}
+
+function createArgControl(key, cfg) {
+  const tpe = cfg.type || 'text';
+
+  if (tpe === 'select') {
+    const sel = el('select', { class: 'select', 'data-arg': key });
+    const choices = Array.isArray(cfg.choices) ? cfg.choices : [];
+    for (const c of choices) {
+      const opt = el('option', { value: String(c) }, [String(c)]);
+      if (cfg.default != null && String(cfg.default) === String(c)) opt.selected = true;
+      sel.appendChild(opt);
+    }
+    return sel;
+  }
+
+  if (tpe === 'checkbox') {
+    const ctl = el('input', { type: 'checkbox', class: 'ctl', 'data-arg': key });
+    ctl.checked = !!cfg.default;
+    return ctl;
+  }
+
+  if (tpe === 'number') {
+    const attrs = {
+      type: 'number',
+      class: 'ctl',
+      'data-arg': key,
+      value: cfg.default != null ? String(cfg.default) : '',
+    };
+    if (cfg.min != null) attrs.min = String(cfg.min);
+    if (cfg.max != null) attrs.max = String(cfg.max);
+    if (cfg.step != null) attrs.step = String(cfg.step);
+    return el('input', attrs);
+  }
+
+  if (tpe === 'range' || tpe === 'slider') {
+    const min = cfg.min != null ? Number(cfg.min) : 0;
+    const max = cfg.max != null ? Number(cfg.max) : 100;
+    const val = cfg.default != null ? Number(cfg.default) : min;
+
+    const wrap = el('div', { style: 'display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center' });
+    const range = el('input', {
+      type: 'range',
+      class: 'range',
+      'data-arg': key,
+      min: String(min),
+      max: String(max),
+      step: String(cfg.step != null ? cfg.step : 1),
+      value: String(val),
+    });
+    const out = el('span', { class: 'sub' }, [String(val)]);
+    tracker.trackEventListener(range, 'input', () => { out.textContent = range.value; });
+    wrap.appendChild(range);
+    wrap.appendChild(out);
+    return wrap;
+  }
+
+  return el('input', {
+    type: 'text',
+    class: 'ctl',
+    'data-arg': key,
+    value: cfg.default != null ? String(cfg.default) : '',
+    placeholder: cfg.placeholder || '',
+  });
+}
+
+function applyPreset(preset) {
+  const builder = q('#argBuilder');
+  if (!builder) return;
+
+  for (const [k, v] of Object.entries(preset || {})) {
+    if (k === 'name' || k === 'title') continue;
+    const input = builder.querySelector(`[data-arg="${k}"]`);
+    if (!input) continue;
+
+    if (input.type === 'checkbox') input.checked = !!v;
+    else input.value = String(v ?? '');
+  }
+
+  toast(tx('actions.toast.presetApplied', 'Preset applied'), 1400, 'success');
+}
+
+function collectArguments() {
+  const args = [];
+  const builder = q('#argBuilder');
+  if (builder) {
+    const controls = $$('[data-arg]', builder);
+    controls.forEach((ctl) => {
+      const key = ctl.getAttribute('data-arg');
+      const flag = '--' + String(key).replace(/_/g, '-');
+
+      if (ctl.type === 'checkbox') {
+        if (ctl.checked) args.push(flag);
+        return;
+      }
+
+      const value = String(ctl.value ?? '').trim();
+      if (!value) return;
+      args.push(flag, value);
+    });
+  }
+
+  const free = String(q('#freeArgs')?.value || '').trim();
+  if (free) args.push(...free.split(/\s+/));
+
+  return args.join(' ');
+}
+
+function renderConsoles() {
+  const container = q('#multiConsole');
+  if (!container) return;
+
+  const effectiveSplit = isMobile() ? 1 : split;
+  container.className = `multiConsole split-${effectiveSplit}`;
+  container.style.setProperty('--rows', effectiveSplit === 4 ? '2' : '1');
+  empty(container);
+
+  for (let i = effectiveSplit; i < panes.length; i++) panes[i] = null;
+
+  for (let i = 0; i < effectiveSplit; i++) {
+    const actionId = panes[i];
+    const action = actionId ? actions.find((a) => a.id === actionId) : null;
+
+    const pane = el('div', { class: 'pane', 'data-index': String(i) });
+
+    const title = el('div', { class: 'paneTitle' }, [
+      el('span', { class: 'dot', style: `background:${statusDotColor(action?.status || 'ready')}` }),
+      action ? el('img', {
+        class: 'paneIcon',
+        src: action.icon,
+        alt: '',
+        onerror: (e) => {
+          e.target.onerror = null;
+          e.target.src = '/actions/actions_icons/default.png';
+        },
+      }) : null,
+      el('div', { class: 'titleBlock' }, [
+        el('div', { class: 'titleLine' }, [el('strong', {}, [action ? action.name : tx('actions.emptyPane', '— Empty Pane —')])]),
+        action ? el('div', { class: 'metaLine' }, [
+          action.version ? el('span', { class: 'chip' }, ['v' + action.version]) : null,
+          action.author ? el('span', { class: 'chip' }, ['by ' + action.author]) : null,
+        ]) : null,
+      ]),
+    ]);
+
+    const paneBtns = el('div', { class: 'paneBtns' });
+    if (!action) {
+      const assignBtn = el('button', { class: 'al-btn', type: 'button' }, [tx('actions.assign', 'Assign')]);
+      tracker.trackEventListener(assignBtn, 'click', () => setAssignTarget(i));
+      paneBtns.appendChild(assignBtn);
+    } else {
+      const runBtn = el('button', { class: 'al-btn', type: 'button' }, [tx('common.run', 'Run')]);
+      tracker.trackEventListener(runBtn, 'click', () => runActionInPane(i));
+
+      const stopBtn = el('button', { class: 'al-btn warn', type: 'button' }, [tx('common.stop', 'Stop')]);
+      tracker.trackEventListener(stopBtn, 'click', () => stopActionInPane(i));
+
+      const clearBtn = el('button', { class: 'al-btn', type: 'button' }, [tx('console.clear', 'Clear')]);
+      tracker.trackEventListener(clearBtn, 'click', () => clearActionLogs(action.id));
+
+      const exportBtn = el('button', { class: 'al-btn', type: 'button' }, ['⬇ Export']);
+      tracker.trackEventListener(exportBtn, 'click', () => exportActionLogs(action.id, action.name));
+
+      const autoBtn = el('button', { class: 'al-btn', type: 'button' }, [autoClearPane[i] ? 'Auto-clear ON' : 'Auto-clear OFF']);
+      if (autoClearPane[i]) autoBtn.classList.add('warn');
+      tracker.trackEventListener(autoBtn, 'click', () => {
+        autoClearPane[i] = !autoClearPane[i];
+        renderConsoles();
+      });
+
+      paneBtns.appendChild(runBtn);
+      paneBtns.appendChild(stopBtn);
+      paneBtns.appendChild(clearBtn);
+      paneBtns.appendChild(exportBtn);
+      paneBtns.appendChild(autoBtn);
+    }
+
+    const header = el('div', { class: 'paneHeader' }, [title, paneBtns]);
+    const log = el('div', { class: 'paneLog', id: `paneLog-${i}` });
+
+    pane.appendChild(header);
+    pane.appendChild(log);
+    container.appendChild(pane);
+
+    tracker.trackEventListener(pane, 'dragover', (e) => {
+      e.preventDefault();
+      pane.classList.add('paneHighlight');
+    });
+    tracker.trackEventListener(pane, 'dragleave', () => pane.classList.remove('paneHighlight'));
+    tracker.trackEventListener(pane, 'drop', (e) => {
+      e.preventDefault();
+      pane.classList.remove('paneHighlight');
+      const dropped = e.dataTransfer?.getData('text/plain');
+      if (!dropped) return;
+      panes[i] = dropped;
+      renderConsoles();
+    });
+
+    renderPaneLog(i, actionId);
+  }
+}
+
+function renderPaneLog(index, actionId) {
+  const logEl = q(`#paneLog-${index}`);
+  if (!logEl) return;
+  empty(logEl);
+
+  if (!actionId) {
+    logEl.appendChild(el('div', { class: 'logline dim' }, [tx('actions.logs.empty', 'Select an action to see logs')]));
+    return;
+  }
+
+  const lines = logsByAction.get(actionId) || [];
+  if (!lines.length) {
+    logEl.appendChild(el('div', { class: 'logline dim' }, [tx('actions.logs.waiting', 'Waiting for logs...')]));
+    return;
+  }
+
+  for (const line of lines) {
+    logEl.appendChild(el('div', { class: `logline ${logLineClass(line)}` }, [String(line)]));
+  }
+
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function logLineClass(line) {
+  const l = String(line || '').toLowerCase();
+  if (l.includes('error') || l.includes('failed') || l.includes('traceback')) return 'err';
+  if (l.includes('warn')) return 'warn';
+  if (l.includes('success') || l.includes('done') || l.includes('complete')) return 'ok';
+  if (l.includes('info') || l.includes('start')) return 'info';
+  return 'dim';
+}
+
+function statusDotColor(status) {
+  if (status === 'running') return 'var(--acid)';
+  if (status === 'success') return 'var(--ok)';
+  if (status === 'error') return 'var(--danger)';
+  return 'var(--accent-2, #18f0ff)';
+}
+
+function setAssignTarget(index) {
+  assignTargetPaneIndex = index;
+  $$('.pane', root).forEach((p) => p.classList.remove('paneHighlight'));
+  q(`.pane[data-index="${index}"]`)?.classList.add('paneHighlight');
+  switchTab('actions');
+}
+
+function clearAssignTarget() {
+  assignTargetPaneIndex = null;
+  $$('.pane', root).forEach((p) => p.classList.remove('paneHighlight'));
+}
+
+function highlightPane(index) {
+  const pane = q(`.pane[data-index="${index}"]`);
+  if (!pane) return;
+  pane.classList.add('paneHighlight');
+  setTimeout(() => pane.classList.remove('paneHighlight'), 900);
+}
+
+async function runActionInPane(index) {
+  const actionId = panes[index] || activeActionId;
+  const action = actions.find((a) => a.id === actionId);
+  if (!action) {
+    toast(tx('actions.toast.selectActionFirst', 'Select an action first'), 1600, 'warning');
+    return;
+  }
+
+  if (!panes[index]) panes[index] = action.id;
+  if (autoClearPane[index]) clearActionLogs(action.id);
+
+  action.status = 'running';
+  renderActionsList();
+  renderConsoles();
+
+  const args = collectArguments();
+  appendActionLog(action.id, tx('actions.toast.startingAction', 'Starting {{name}}...').replace('{{name}}', action.name));
+
+  try {
+    const res = await api.post('/run_script', { script_name: action.module || action.id, args });
+    if (res.status !== 'success') throw new Error(res.message || 'Run failed');
+    startOutputPolling(action.id);
+  } catch (err) {
+    action.status = 'error';
+    appendActionLog(action.id, `Error: ${err.message}`);
+    renderActionsList();
+    renderConsoles();
+    toast(`${tx('common.error', 'Error')}: ${err.message}`, 2600, 'error');
+  }
+}
+
+async function stopActionInPane(index) {
+  const actionId = panes[index] || activeActionId;
+  const action = actions.find((a) => a.id === actionId);
+  if (!action) return;
+
+  try {
+    const res = await api.post('/stop_script', { script_name: action.path || action.module || action.id });
+    if (res.status !== 'success') throw new Error(res.message || 'Stop failed');
+
+    action.status = 'ready';
+    stopOutputPolling(action.id);
+    appendActionLog(action.id, tx('actions.toast.stoppedByUser', 'Stopped by user'));
+    renderActionsList();
+    renderConsoles();
+  } catch (err) {
+    toast(`${tx('actions.toast.failedToStop', 'Failed to stop')}: ${err.message}`, 2600, 'error');
+  }
+}
+
+function clearActionLogs(actionId) {
+  logsByAction.set(actionId, []);
+  for (let i = 0; i < panes.length; i++) if (panes[i] === actionId) renderPaneLog(i, actionId);
+
+  const action = actions.find((a) => a.id === actionId);
+  if (action) {
+    api.post('/clear_script_output', { script_name: action.path || action.module || action.id }).catch(() => {});
+  }
+}
+
+function exportActionLogs(actionId, actionName = 'action') {
+  const logs = logsByAction.get(actionId) || [];
+  if (!logs.length) {
+    toast(tx('actions.toast.noLogsToExport', 'No logs to export'), 1600, 'warning');
+    return;
+  }
+
+  const blob = new Blob([logs.join('\n')], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${actionName}_logs_${Date.now()}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function appendActionLog(actionId, line) {
+  const list = logsByAction.get(actionId) || [];
+  list.push(line);
+  logsByAction.set(actionId, list);
+  for (let i = 0; i < panes.length; i++) if (panes[i] === actionId) renderPaneLog(i, actionId);
+}
+
+function startOutputPolling(actionId) {
+  stopOutputPolling(actionId);
+
+  const action = actions.find((a) => a.id === actionId);
+  if (!action) return;
+
+  const scriptPath = action.path || action.module || action.id;
+
+  const tick = async () => {
+    try {
+      const res = await api.get(`/get_script_output/${encodeURIComponent(scriptPath)}`, { timeout: 8000, retries: 0 });
+      if (res?.status !== 'success') throw new Error('Invalid output payload');
+
+      const data = res.data || {};
+      const output = Array.isArray(data.output) ? data.output : [];
+      logsByAction.set(actionId, output);
+
+      if (data.is_running) {
+        action.status = 'running';
+        renderActionsList();
+        for (let i = 0; i < panes.length; i++) if (panes[i] === actionId) renderPaneLog(i, actionId);
+        const id = setTimeout(tick, 1000);
+        pollingTimers.set(actionId, id);
+        return;
+      }
+
+      if (data.last_error) {
+        action.status = 'error';
+        appendActionLog(actionId, `Error: ${data.last_error}`);
+      } else {
+        action.status = 'success';
+        appendActionLog(actionId, tx('actions.logs.completed', 'Script completed'));
+      }
+
+      stopOutputPolling(actionId);
+      renderActionsList();
+      renderConsoles();
+    } catch {
+      // Keep trying while action is expected running.
+      if (action.status === 'running') {
+        const id = setTimeout(tick, 1200);
+        pollingTimers.set(actionId, id);
+      }
+    }
+  };
+
+  tick();
+}
+
+function stopOutputPolling(actionId) {
+  const timer = pollingTimers.get(actionId);
+  if (timer) {
+    clearTimeout(timer);
+    pollingTimers.delete(actionId);
+  }
+}

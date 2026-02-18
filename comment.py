@@ -280,19 +280,23 @@ class CommentAI:
         if not rows:
             return None
 
-        # Weighted selection pool
-        pool: List[str] = []
+        # Weighted selection using random.choices (no temporary list expansion)
+        texts: List[str] = []
+        weights: List[int] = []
         for row in rows:
-            try:
-                w = int(_row_get(row, "weight", 1)) or 1
-            except Exception:
-                w = 1
-            w = max(1, w)
             text = _row_get(row, "text", "")
             if text:
-                pool.extend([text] * w)
+                try:
+                    w = int(_row_get(row, "weight", 1)) or 1
+                except Exception:
+                    w = 1
+                texts.append(text)
+                weights.append(max(1, w))
 
-        chosen = random.choice(pool) if pool else _row_get(rows[0], "text", None)
+        if texts:
+            chosen = random.choices(texts, weights=weights, k=1)[0]
+        else:
+            chosen = _row_get(rows[0], "text", None)
 
         # Templates {var}
         if chosen and params:

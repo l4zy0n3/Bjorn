@@ -7,7 +7,6 @@ from __future__ import annotations
 import os
 import json
 import shutil
-import cgi
 from pathlib import Path
 from io import BytesIO
 from typing import Any, Dict, Optional
@@ -155,7 +154,7 @@ class FileUtils:
                 handler.send_header("Content-Disposition", f'attachment; filename="{os.path.basename(file_path)}"')
                 handler.end_headers()
                 with open(file_path, 'rb') as file:
-                    handler.wfile.write(file.read())
+                    shutil.copyfileobj(file, handler.wfile)
             else:
                 handler.send_response(404)
                 handler.end_headers()

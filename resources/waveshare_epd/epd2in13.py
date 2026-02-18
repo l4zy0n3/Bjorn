@@ -1,15 +1,23 @@
 import logging
+import time
 from . import epdconfig
+from logger import Logger
 
 # Display resolution
 EPD_WIDTH       = 122
 EPD_HEIGHT      = 250
 
-logger = logging.getLogger(__name__)
+logger = Logger(name="epd2in13.py", level=logging.DEBUG)
 
 class EPD:
     def __init__(self):
         self.is_initialized = False  # New flag to track if the display has been initialized #INFINITION
+        # Defensive timeout/logging for BUSY pin stalls.
+        self.busy_timeout_s = 30.0
+        self.busy_poll_ms = 100
+        self.busy_log_interval_s = 5.0
+        # Keep this False in production to avoid log spam on normal refresh cycles.
+        self.log_busy_transitions = False
         self.reset_pin = epdconfig.RST_PIN
         self.dc_pin = epdconfig.DC_PIN
         self.busy_pin = epdconfig.BUSY_PIN
@@ -52,9 +60,24 @@ class EPD:
         epdconfig.spi_writebyte([data])
         epdconfig.digital_write(self.cs_pin, 1)
         
-    def ReadBusy(self):        
-        while(epdconfig.digital_read(self.busy_pin) == 1):      # 0: idle, 1: busy
-            epdconfig.delay_ms(100)            
+    def ReadBusy(self):
+        # 0: idle, 1: busy
+        started = time.monotonic()
+        last_log = started
+        while(epdconfig.digital_read(self.busy_pin) == 1):
+            now = time.monotonic()
+            waited = now - started
+            if waited >= self.busy_timeout_s:
+                raise TimeoutError(
+                    f"EPD busy timeout after {self.busy_timeout_s:.1f}s "
+                    f"(pin={self.busy_pin}, state=1, expected idle=0)"
+                )
+            if (now - last_log) >= self.busy_log_interval_s:
+                logger.warning(
+                    f"ReadBusy waiting {waited:.1f}s (pin={self.busy_pin}, state=1/busy)"
+                )
+                last_log = now
+            epdconfig.delay_ms(self.busy_poll_ms)
 
     def TurnOnDisplay(self):
         self.send_command(0x22) # DISPLAY_UPDATE_CONTROL_2
@@ -62,9 +85,11 @@ class EPD:
         self.send_command(0x20) # MASTER_ACTIVATION
         self.send_command(0xFF) # TERMINATE_FRAME_READ_WRITE
         
-        logger.debug("e-Paper busy")
+        if self.log_busy_transitions:
+            logger.debug("e-Paper busy")
         self.ReadBusy()
-        logger.debug("e-Paper busy release")
+        if self.log_busy_transitions:
+            logger.debug("e-Paper busy release")
 
     def init(self, lut):
         if not self.is_initialized:  # Avoid repeated initialization and accumulation of File descriptors #INFINITION
@@ -195,4 +220,3 @@ class EPD:
         epdconfig.module_exit()
         
 ### END OF FILE ###
-

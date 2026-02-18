@@ -431,6 +431,390 @@ class VulnUtils:
             logger.exception("serve_cve_bulk failed")
             self._send_json(handler, 500, {"status": "error", "message": str(e)})
 
+    def serve_cve_bulk_exploits(self, handler, data: Dict[str, Any]) -> None:
+        """Bulk exploit search for a list of CVE IDs.
+
+        Called by the frontend "Search All Exploits" button via
+        POST /api/cve/bulk_exploits  { "cves": ["CVE-XXXX-YYYY", ...] }
+
+        For every CVE the method:
+          1. Checks the local DB cache first (avoids hammering external APIs on
+             low-power hardware like the Pi Zero).
+          2. If the cached exploit list is empty or the record is stale (>48 h),
+             attempts to fetch exploit hints from:
+             - GitHub Advisory / search  (ghsa-style refs stored in NVD)
+             - Rapid7 AttackerKB   (public, no key required)
+          3. Persists the updated exploit list back to cve_meta so subsequent
+             calls are served instantly from cache.
+
+        Returns a summary dict so the frontend can update counters.
+        """
+        try:
+            cves: List[str] = data.get("cves") or []
+            if not cves:
+                self._send_json(handler, 200, {"status": "ok", "processed": 0, "with_exploits": 0})
+                return
+
+            # cap per-chunk to avoid timeouts on Pi Zero
+            cves = [c for c in cves if c and c.upper().startswith("CVE-")][:20]
+
+            db = self.shared_data.db
+            processed = 0
+            with_exploits = 0
+            results: Dict[str, Any] = {}
+
+            EXPLOIT_STALE_TTL = 48 * 3600  # re-check after 48 h
+
+            for cve_id in cves:
+                try:
+                    # --- 1. DB cache lookup ---
+                    row = None
+                    try:
+                        row = db.get_cve_meta(cve_id)
+                    except Exception:
+                        pass
+
+                    exploits: List[Dict[str, Any]] = []
+                    cache_fresh = False
+
+                    if row:
+                        cached_exploits = row.get("exploits_json") or []
+                        if isinstance(cached_exploits, str):
+                            try:
+                                cached_exploits = json.loads(cached_exploits)
+                            except Exception:
+                                cached_exploits = []
+
+                        age = 0
+                        try:
+                            age = time.time() - int(row.get("updated_at") or 0)
+                        except Exception:
+                            pass
+
+                        if cached_exploits and age < EXPLOIT_STALE_TTL:
+                            exploits = cached_exploits
+                            cache_fresh = True
+
+                    # --- 2. External fetch if cache is stale / empty ---
+                    if not cache_fresh:
+                        exploits = self._fetch_exploits_for_cve(cve_id)
+
+                        # Persist back to DB (merge with any existing meta)
+                        try:
+                            existing = self.cve_enricher.get(cve_id, use_cache_only=True) if self.cve_enricher else {}
+                            patch = {
+                                "cve_id": cve_id,
+                                "description": existing.get("description") or f"{cve_id} vulnerability",
+                                "cvss": existing.get("cvss"),
+                                "references": existing.get("references") or [],
+                                "affected": existing.get("affected") or [],
+                                "exploits": exploits,
+                                "is_kev": existing.get("is_kev", False),
+                                "epss": existing.get("epss"),
+                                "epss_percentile": existing.get("epss_percentile"),
+                                "updated_at": time.time(),
+                            }
+                            db.upsert_cve_meta(patch)
+                        except Exception:
+                            logger.debug("Failed to persist exploits for %s", cve_id, exc_info=True)
+
+                    processed += 1
+                    if exploits:
+                        with_exploits += 1
+
+                    results[cve_id] = {
+                        "exploit_count": len(exploits),
+                        "exploits": exploits,
+                        "from_cache": cache_fresh,
+                    }
+
+                except Exception:
+                    logger.debug("Exploit search failed for %s", cve_id, exc_info=True)
+                    results[cve_id] = {"exploit_count": 0, "exploits": [], "from_cache": False}
+
+            self._send_json(handler, 200, {
+                "status": "ok",
+                "processed": processed,
+                "with_exploits": with_exploits,
+                "results": results,
+            })
+
+        except Exception as e:
+            logger.exception("serve_cve_bulk_exploits failed")
+            self._send_json(handler, 500, {"status": "error", "message": str(e)})
+
+    def _fetch_exploits_for_cve(self, cve_id: str) -> List[Dict[str, Any]]:
+        """Look up exploit data from the local exploit_feeds table.
+        No external API calls — populated by serve_feed_sync().
+        """
+        try:
+            rows = self.shared_data.db.query(
+                """
+                SELECT source, edb_id, title, url, published, platform, type, verified
+                FROM exploit_feeds
+                WHERE cve_id = ?
+                ORDER BY verified DESC, published DESC
+                LIMIT 10
+                """,
+                (cve_id,),
+            )
+            return [
+                {
+                    "source":      r.get("source", ""),
+                    "edb_id":      r.get("edb_id"),
+                    "description": r.get("title", ""),
+                    "url":         r.get("url", ""),
+                    "published":   r.get("published", ""),
+                    "platform":    r.get("platform", ""),
+                    "type":        r.get("type", ""),
+                    "verified":    bool(r.get("verified")),
+                }
+                for r in (rows or [])
+            ]
+        except Exception:
+            logger.debug("Local exploit lookup failed for %s", cve_id, exc_info=True)
+            return []
+
+    # ------------------------------------------------------------------
+    # Feed sync — called by POST /api/feeds/sync
+    # ------------------------------------------------------------------
+
+    # Schema created lazily on first sync
+    _FEED_SCHEMA = """
+        CREATE TABLE IF NOT EXISTS exploit_feeds (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            cve_id      TEXT    NOT NULL,
+            source      TEXT    NOT NULL,
+            edb_id      TEXT,
+            title       TEXT,
+            url         TEXT,
+            published   TEXT,
+            platform    TEXT,
+            type        TEXT,
+            verified    INTEGER DEFAULT 0,
+            UNIQUE(cve_id, source, edb_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ef_cve ON exploit_feeds(cve_id);
+
+        CREATE TABLE IF NOT EXISTS feed_sync_state (
+            feed          TEXT PRIMARY KEY,
+            last_synced   INTEGER DEFAULT 0,
+            record_count  INTEGER DEFAULT 0,
+            status        TEXT DEFAULT 'never'
+        );
+    """
+
+    def _ensure_feed_schema(self) -> None:
+        for stmt in self._FEED_SCHEMA.strip().split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                try:
+                    self.shared_data.db.execute(stmt)
+                except Exception:
+                    pass
+
+    def _set_sync_state(self, feed: str, count: int, status: str) -> None:
+        try:
+            self.shared_data.db.execute(
+                """
+                INSERT INTO feed_sync_state (feed, last_synced, record_count, status)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(feed) DO UPDATE SET
+                    last_synced  = excluded.last_synced,
+                    record_count = excluded.record_count,
+                    status       = excluded.status
+                """,
+                (feed, int(time.time()), count, status),
+            )
+        except Exception:
+            logger.debug("Failed to update feed_sync_state for %s", feed, exc_info=True)
+
+    def serve_feed_sync(self, handler) -> None:
+        """POST /api/feeds/sync — download CISA KEV + Exploit-DB + EPSS into local DB."""
+        self._ensure_feed_schema()
+        results: Dict[str, Any] = {}
+
+        # ── 1. CISA KEV ────────────────────────────────────────────────
+        try:
+            kev_count = self._sync_cisa_kev()
+            self._set_sync_state("cisa_kev", kev_count, "ok")
+            results["cisa_kev"] = {"status": "ok", "count": kev_count}
+            logger.info("CISA KEV synced — %d records", kev_count)
+        except Exception as e:
+            self._set_sync_state("cisa_kev", 0, "error")
+            results["cisa_kev"] = {"status": "error", "message": str(e)}
+            logger.exception("CISA KEV sync failed")
+
+        # ── 2. Exploit-DB CSV ───────────────────────────────────────────
+        try:
+            edb_count = self._sync_exploitdb()
+            self._set_sync_state("exploitdb", edb_count, "ok")
+            results["exploitdb"] = {"status": "ok", "count": edb_count}
+            logger.info("Exploit-DB synced — %d records", edb_count)
+        except Exception as e:
+            self._set_sync_state("exploitdb", 0, "error")
+            results["exploitdb"] = {"status": "error", "message": str(e)}
+            logger.exception("Exploit-DB sync failed")
+
+        # ── 3. EPSS scores ──────────────────────────────────────────────
+        try:
+            epss_count = self._sync_epss()
+            self._set_sync_state("epss", epss_count, "ok")
+            results["epss"] = {"status": "ok", "count": epss_count}
+            logger.info("EPSS synced — %d records", epss_count)
+        except Exception as e:
+            self._set_sync_state("epss", 0, "error")
+            results["epss"] = {"status": "error", "message": str(e)}
+            logger.exception("EPSS sync failed")
+
+        any_ok = any(v.get("status") == "ok" for v in results.values())
+        self._send_json(handler, 200, {
+            "status":  "ok" if any_ok else "error",
+            "feeds":   results,
+            "synced_at": int(time.time()),
+        })
+
+    def serve_feed_status(self, handler) -> None:
+        """GET /api/feeds/status — return last sync timestamps and counts."""
+        try:
+            self._ensure_feed_schema()
+            rows = self.shared_data.db.query(
+                "SELECT feed, last_synced, record_count, status FROM feed_sync_state"
+            ) or []
+            state = {r["feed"]: {
+                "last_synced":  r["last_synced"],
+                "record_count": r["record_count"],
+                "status":       r["status"],
+            } for r in rows}
+
+            # total exploits in local DB
+            try:
+                total_row = self.shared_data.db.query_one(
+                    "SELECT COUNT(*) as n FROM exploit_feeds"
+                )
+                total = total_row["n"] if total_row else 0
+            except Exception:
+                total = 0
+
+            self._send_json(handler, 200, {"feeds": state, "total_exploits": total})
+        except Exception as e:
+            logger.exception("serve_feed_status failed")
+            self._send_json(handler, 500, {"status": "error", "message": str(e)})
+
+    # ── Feed downloaders ────────────────────────────────────────────────
+
+    def _sync_cisa_kev(self) -> int:
+        import urllib.request, json
+        url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+        req = urllib.request.Request(url, headers={"User-Agent": "BjornVulnScanner/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        vulns = data.get("vulnerabilities") or []
+        count = 0
+        for v in vulns:
+            cve_id = (v.get("cveID") or "").strip()
+            if not cve_id:
+                continue
+            try:
+                self.shared_data.db.execute(
+                    """
+                    INSERT OR IGNORE INTO exploit_feeds
+                        (cve_id, source, title, url, published, type, verified)
+                    VALUES (?, 'CISA KEV', ?, ?, ?, 'known-exploited', 1)
+                    """,
+                    (
+                        cve_id,
+                        (v.get("vulnerabilityName") or cve_id)[:255],
+                        f"https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+                        v.get("dateAdded") or "",
+                    ),
+                )
+                # also flag cve_meta.is_kev
+                try:
+                    self.shared_data.db.execute(
+                        "UPDATE cve_meta SET is_kev = 1 WHERE cve_id = ?", (cve_id,)
+                    )
+                except Exception:
+                    pass
+                count += 1
+            except Exception:
+                pass
+        return count
+
+    def _sync_exploitdb(self) -> int:
+        import urllib.request, csv, io
+        url = "https://gitlab.com/exploit-database/exploitdb/-/raw/main/files_exploits.csv"
+        req = urllib.request.Request(url, headers={"User-Agent": "BjornVulnScanner/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            content = r.read().decode("utf-8", errors="replace")
+        reader = csv.DictReader(io.StringIO(content))
+        count = 0
+        for row in reader:
+            # exploit-db CSV columns: id, file, description, date_published,
+            #   author, type, platform, port, date_added, verified, codes, tags, aliases, screenshot_url, application_url, source_url
+            codes = row.get("codes") or ""
+            # 'codes' field contains semicolon-separated CVE IDs
+            cve_ids = [c.strip() for c in codes.split(";") if c.strip().upper().startswith("CVE-")]
+            if not cve_ids:
+                continue
+            edb_id    = (row.get("id") or "").strip()
+            title     = (row.get("description") or "")[:255]
+            published = (row.get("date_published") or row.get("date_added") or "").strip()
+            platform  = (row.get("platform") or "").strip()
+            etype     = (row.get("type") or "").strip()
+            verified  = 1 if str(row.get("verified") or "0").strip() == "1" else 0
+            url_path  = (row.get("file") or "").strip()
+            edb_url   = f"https://www.exploit-db.com/exploits/{edb_id}" if edb_id else ""
+            for cve_id in cve_ids:
+                try:
+                    self.shared_data.db.execute(
+                        """
+                        INSERT OR IGNORE INTO exploit_feeds
+                            (cve_id, source, edb_id, title, url, published, platform, type, verified)
+                        VALUES (?, 'Exploit-DB', ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (cve_id, edb_id, title, edb_url, published, platform, etype, verified),
+                    )
+                    count += 1
+                except Exception:
+                    pass
+        return count
+
+    def _sync_epss(self) -> int:
+        import urllib.request, gzip, csv, io
+        url = "https://epss.cyentia.com/epss_scores-current.csv.gz"
+        req = urllib.request.Request(url, headers={"User-Agent": "BjornVulnScanner/1.0"})
+        count = 0
+        with urllib.request.urlopen(req, timeout=60) as r:
+            with gzip.GzipFile(fileobj=r) as gz:
+                wrapper = io.TextIOWrapper(gz, encoding="utf-8", errors="replace")
+                # skip leading comment lines (#model_version:...)
+                reader = csv.DictReader(
+                    (line for line in wrapper if not line.startswith("#"))
+                )
+                for row in reader:
+                    cve_id = (row.get("cve") or "").strip()
+                    if not cve_id:
+                        continue
+                    try:
+                        epss  = float(row.get("epss") or 0)
+                        pct   = float(row.get("percentile") or 0)
+                        self.shared_data.db.execute(
+                            """
+                    INSERT INTO cve_meta (cve_id, epss, epss_percentile, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(cve_id) DO UPDATE SET
+                        epss             = excluded.epss,
+                        epss_percentile  = excluded.epss_percentile,
+                        updated_at       = excluded.updated_at
+                    """,
+                            (cve_id, epss, pct, int(time.time())),
+                        )
+                        count += 1
+                    except Exception:
+                        pass
+        return count
+
     def serve_exploitdb_by_cve(self, handler, cve_id: str) -> None:
         """Get Exploit-DB entries for a CVE."""
         try:

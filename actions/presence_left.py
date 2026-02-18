@@ -10,7 +10,8 @@ PresenceLeave — Sends a Discord webhook when the targeted host LEAVES the netw
 import requests
 from typing import Optional
 import logging
-from datetime import datetime, timezone
+import datetime
+
 from logger import Logger
 from shared import SharedData  # only if executed directly for testing
 
@@ -30,19 +31,19 @@ b_trigger    = "on_leave"     # <-- Host LEFT the network (ON -> OFF since last 
 b_requires   = {"any":[{"mac_is":"60:57:c8:51:63:fb"}]}  # adapt as needed
 b_enabled = 1
 
-# Replace with your webhook (can reuse the same as PresenceJoin)
-DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1416433823456956561/MYc2mHuqgK_U8tA96fs2_-S1NVchPzGOzan9EgLr4i8yOQa-3xJ6Z-vMejVrpPfC3OfD"
+DISCORD_WEBHOOK_URL = ""  # Configure via shared_data or DB
 
 class PresenceLeave:
     def __init__(self, shared_data):
         self.shared_data = shared_data
 
     def _send(self, text: str) -> None:
-        if not DISCORD_WEBHOOK_URL or "webhooks/" not in DISCORD_WEBHOOK_URL:
+        url = getattr(self.shared_data, 'discord_webhook_url', None) or DISCORD_WEBHOOK_URL
+        if not url or "webhooks/" not in url:
             logger.error("PresenceLeave: DISCORD_WEBHOOK_URL missing/invalid.")
             return
         try:
-            r = requests.post(DISCORD_WEBHOOK_URL, json={"content": text}, timeout=6)
+            r = requests.post(url, json={"content": text}, timeout=6)
             if r.status_code < 300:
                 logger.info("PresenceLeave: webhook sent.")
             else:
@@ -61,7 +62,8 @@ class PresenceLeave:
             ip_s = (ip or (row.get("IPs") or "").split(";")[0] or "").strip()
 
             # Add timestamp in UTC
-            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
 
             msg  = f"❌ **Presence lost**\n"
             msg += f"- Host: {host or 'unknown'}\n"

@@ -1,9 +1,11 @@
 # shared.py
 # Core component for managing shared resources and data for Bjorn project
 # Handles initialization, configuration, logging, fonts, images, and database management
+# OPTIMIZED FOR PI ZERO 2: Lazy Loading, Thread-Safety, and Low Memory Footprint.
 
 import os
 import re
+import json
 import importlib
 import random
 import time
@@ -11,16 +13,17 @@ import ast
 import logging
 import subprocess
 import threading
+import socket
+import gc
+import weakref
+from datetime import datetime
 from typing import Dict, List, Optional, Any
 from PIL import Image, ImageFont 
 from logger import Logger
-# from epd_helper import EPDHelper
 from epd_manager import EPDManager
-
 from database import BjornDatabase
 
 logger = Logger(name="shared.py", level=logging.DEBUG)
-
 
 class SharedData:
     """Centralized shared data manager for all Bjorn modules"""
@@ -29,9 +32,27 @@ class SharedData:
         # Initialize core paths first
         self.initialize_paths()
         
-        # Initialize status tracking
-        self.status_list = []
+        # --- THREAD SAFETY LOCKS ---
+        # RLock allows the same thread to acquire the lock multiple times (re-entrant)
+        # essential for config loading/saving which might be called recursively.
+        self.config_lock = threading.RLock() 
+        self.scripts_lock = threading.Lock()
+        self.output_lock = threading.Lock()
+        self.health_lock = threading.Lock()
+        
+        # Initialize status tracking (set prevents duplicates and unbounded growth)
+        self.status_list = set()
         self.last_comment_time = time.time()
+        self.curr_status = {"status": "Idle", "details": ""}
+        self.status_lock = threading.Lock()
+        
+        # --- BI-DIRECTIONAL LINKS (WEAK) ---
+        # Prevent circular references while allowing access to the supervisor
+        self._bjorn_ref = None
+        
+        # --- CACHING ---
+        self._config_json_cache = None
+        self._config_json_ts = 0
         
         # Event for orchestrator wake-up (Avoids CPU busy-waiting)
         self.queue_event = threading.Event()
@@ -43,7 +64,7 @@ class SharedData:
         # Initialize database (single source of truth)
         self.db = BjornDatabase()
         
-        # Load existing configuration from database
+        # Load existing configuration from database (Thread-safe)
         self.load_config()
         
         # Update security blacklists
@@ -54,9 +75,12 @@ class SharedData:
         self.initialize_runtime_variables()
         self.initialize_statistics()
         self.load_fonts()
+        
+        # --- LAZY LOADING IMAGES ---
+        # Indexes paths instead of loading pixels to RAM
         self.load_images()
         
-        logger.info("SharedData initialization complete")
+        logger.info("SharedData initialization complete (Pi Zero 2 Optimized)")
 
     def initialize_paths(self):
         """Initialize all application paths and create necessary directories"""
@@ -78,7 +102,6 @@ class SharedData:
         self.logs_dir = os.path.join(self.data_dir, 'logs')
         self.output_dir = os.path.join(self.data_dir, 'output')
         self.input_dir = os.path.join(self.data_dir, 'input')
-
         
         # Output subdirectories
         self.data_stolen_dir = os.path.join(self.output_dir, 'data_stolen')
@@ -118,6 +141,10 @@ class SharedData:
         self.log_file = os.path.join(self.logs_dir, 'Bjorn.log')
         self.web_console_log = os.path.join(self.logs_dir, 'web_console_log.txt')
         
+        # AI Models
+        self.ai_models_dir = os.path.join(self.bjorn_user_dir, 'ai_models')
+        self.ml_exports_dir = os.path.join(self.data_dir, 'ml_exports')
+        
         # Create all necessary directories
         self._create_directories()
 
@@ -130,7 +157,8 @@ class SharedData:
             self.fonts_dir, self.default_config_dir, self.default_comments_dir,
             self.status_images_dir, self.static_images_dir, self.dictionary_dir,
             self.potfiles_dir, self.wordlists_dir, self.nmap_prefixes_dir,
-            self.backup_dir, self.settings_dir
+            self.backup_dir, self.settings_dir,
+            self.ai_models_dir, self.ml_exports_dir
         ]
         
         for directory in directories:
@@ -142,32 +170,102 @@ class SharedData:
     def get_default_config(self) -> Dict[str, Any]:
         """Return default configuration settings"""
         return {
-            # General Settings
-            "__title_Bjorn__": "Settings",
+            # Core / identity
+            "__title_Bjorn__": "Core Settings",
             "bjorn_name": "Bjorn",
             "current_character": "BJORN",
-            "manual_mode": False,
-            "debug_mode": True,
-            "lang_priority":["en", "fr", "es"] ,
             "lang": "en",
-            
-            # Web Server Settings
+            "lang_priority": ["en", "fr", "es"],
+            "__tooltips_i18n__": {
+                "manual_mode": "settings.tooltip.manual_mode",
+                "ai_mode": "settings.tooltip.ai_mode",
+                "learn_in_auto": "settings.tooltip.learn_in_auto",
+                "debug_mode": "settings.tooltip.debug_mode",
+                "websrv": "settings.tooltip.websrv",
+                "webauth": "settings.tooltip.webauth",
+                "bjorn_debug_enabled": "settings.tooltip.bjorn_debug_enabled",
+                "retry_success_actions": "settings.tooltip.retry_success_actions",
+                "retry_failed_actions": "settings.tooltip.retry_failed_actions",
+                "ai_server_url": "settings.tooltip.ai_server_url",
+                "ai_exploration_rate": "settings.tooltip.ai_exploration_rate",
+                "ai_sync_interval": "settings.tooltip.ai_sync_interval",
+                "ai_server_max_failures_before_auto": "settings.tooltip.ai_server_max_failures_before_auto",
+                "startup_delay": "settings.tooltip.startup_delay",
+                "web_delay": "settings.tooltip.web_delay",
+                "screen_delay": "settings.tooltip.screen_delay",
+                "livestatus_delay": "settings.tooltip.livestatus_delay",
+                "epd_enabled": "settings.tooltip.epd_enabled",
+                "showiponscreen": "settings.tooltip.showiponscreen",
+                "shared_update_interval": "settings.tooltip.shared_update_interval",
+                "vuln_update_interval": "settings.tooltip.vuln_update_interval",
+                "semaphore_slots": "settings.tooltip.semaphore_slots",
+                "runtime_tick_s": "settings.tooltip.runtime_tick_s",
+                "runtime_gc_interval_s": "settings.tooltip.runtime_gc_interval_s",
+                "default_network_interface": "settings.tooltip.default_network_interface",
+                "use_custom_network": "settings.tooltip.use_custom_network",
+                "custom_network": "settings.tooltip.custom_network",
+                "portlist": "settings.tooltip.portlist",
+                "portstart": "settings.tooltip.portstart",
+                "portend": "settings.tooltip.portend",
+                "scan_max_host_threads": "settings.tooltip.scan_max_host_threads",
+                "scan_max_port_threads": "settings.tooltip.scan_max_port_threads",
+                "mac_scan_blacklist": "settings.tooltip.mac_scan_blacklist",
+                "ip_scan_blacklist": "settings.tooltip.ip_scan_blacklist",
+                "hostname_scan_blacklist": "settings.tooltip.hostname_scan_blacklist",
+                "vuln_fast": "settings.tooltip.vuln_fast",
+                "nse_vulners": "settings.tooltip.nse_vulners",
+                "vuln_max_ports": "settings.tooltip.vuln_max_ports",
+                "use_actions_studio": "settings.tooltip.use_actions_studio",
+                "bruteforce_exhaustive_enabled": "settings.tooltip.bruteforce_exhaustive_enabled",
+                "bruteforce_exhaustive_max_candidates": "settings.tooltip.bruteforce_exhaustive_max_candidates",
+            },
+
+            # Operation modes
+            "__title_modes__": "Operation Modes",
+            "manual_mode": True,
+            "ai_mode": True,
+            "learn_in_auto": False,
+            "debug_mode": True,
+
+            # Web server / UI behavior
+            "__title_web__": "Web Server",
             "websrv": True,
             "webauth": False,
+            "consoleonwebstart": True,
+            "web_logging_enabled": False,
+            "bjorn_debug_enabled": False,
             "retry_success_actions": False,
             "retry_failed_actions": True,
             "blacklistcheck": True,
-            "consoleonwebstart": True,
-            
-            # Timing Settings
-            "startup_delay": 5,
-            "web_delay": 2,
-            "screen_delay": 1,
+
+            # AI / RL
+            "__title_ai__": "AI / RL",
+            "ai_server_url": "http://192.168.1.40:8000",
+            "ai_exploration_rate": 0.1,
+            "ai_sync_interval": 60,
+            "ai_training_min_samples": 5,
+            "ai_confirm_threshold": 0.3,
+            "ai_batch_size": 100,
+            "ai_export_max_records": 1000,
+            "ai_server_max_failures_before_auto": 3,
+            "ai_upload_retry_backoff_s": 120,
+            "ai_consolidation_max_batches": 2,
+            "ai_feature_hosts_limit": 512,
+            "ai_delete_export_after_upload": True,
+            "rl_train_batch_size": 10,
+
+            # Global timing / refresh
+            "__title_timing__": "Timing",
+            "startup_delay": 3,
+            "web_delay": 3,
+            "screen_delay": 3,
+            "web_screenshot_interval_s": 4.0,
             "comment_delaymin": 15,
             "comment_delaymax": 30,
             "livestatus_delay": 8,
-            
-            # Display Settings
+
+            # Display / UI
+            "__title_display__": "Display",
             "epd_enabled": True,
             "screen_reversed": True,
             "web_screen_reversed": True,
@@ -183,30 +281,49 @@ class SharedData:
             "fullrefresh_delay": 600,
             "image_display_delaymin": 2,
             "image_display_delaymax": 8,
-            
-            # EPD Display Settings
+            "health_log_interval": 60,
+            "epd_watchdog_timeout": 45,
+            "epd_recovery_cooldown": 60,
+            "epd_error_backoff": 2,
+
+            # Runtime state updater
+            "__title_runtime__": "Runtime Updater",
+            "runtime_tick_s": 0.5,
+            "runtime_gc_interval_s": 0.0,
+
+            # Power management
+            "__title_power__": "Power Management",
+            "pisugar_enabled": True,
+            "pisugar_socket_path": "/tmp/pisugar-server.sock",
+            "pisugar_tcp_host": "127.0.0.1",
+            "pisugar_tcp_port": 8423,
+            "pisugar_timeout_s": 1.5,
+            "battery_probe_failures_before_none": 4,
+            "battery_probe_grace_seconds": 120,
+
+            # EPD / fonts / positions
+            "__title_epd__": "EPD & Fonts",
             "ref_width": 122,
             "ref_height": 250,
             "epd_type": "epd2in13_V4",
             "defaultfonttitle": "Viking.TTF",
             "defaultfont": "Arial.ttf",
             "line_spacing": 1,
-            
-            # Display Positions
             "frise_default_x": 0,
             "frise_default_y": 160,
             "frise_epd2in7_x": 50,
             "frise_epd2in7_y": 160,
-            
-            # Network Interface Settings
+
+            # Network interfaces
+            "__title_interfaces__": "Network Interfaces",
             "ip_iface_priority": ["wlan0", "eth0"],
             "neigh_wifi_iface": "wlan0",
             "neigh_ethernet_iface": "eth0",
             "neigh_usb_iface": "usb0",
             "neigh_bluetooth_ifaces": ["pan0", "bnep0"],
-            
-            # Security Lists
-            "__title_lists__": "List Settings",
+
+            # Network scanning
+            "__title_network__": "Network Scanning",
             "portlist": [20, 21, 22, 23, 25, 53, 69, 80, 110, 111, 135, 137, 139, 143, 
                         161, 162, 389, 443, 445, 512, 513, 514, 587, 636, 993, 995, 
                         1080, 1433, 1521, 2049, 3306, 3389, 5000, 5001, 5432, 5900, 
@@ -214,47 +331,181 @@ class SharedData:
             "mac_scan_blacklist": [],
             "ip_scan_blacklist": [],
             "hostname_scan_blacklist": ["bjorn.home"],
-            "steal_file_names": ["ssh.csv", "hack.txt"],
-            "steal_file_extensions": [".bjorn", ".hack", ".flag"],
-            "ignored_smb_shares": ["print$", "ADMIN$", "IPC$"],
-            
-            # Network Scanning Settings
-            "__title_network__": "Network",
             "nmap_scan_aggressivity": "-T2",
             "portstart": 1,
             "portend": 2,
             "use_custom_network": False,
             "custom_network": "192.168.1.0/24",
             "default_network_interface": "wlan0",
+            "scan_max_host_threads": 3,
+            "scan_max_port_threads": 8,
+            "scan_port_timeout_s": 1.0,
+            "scan_mac_retries": 2,
+            "scan_mac_retry_delay_s": 0.6,
+            "scan_arping_timeout_s": 1.5,
+            "scan_nmap_discovery_timeout_s": 90,
+            "scan_nmap_discovery_args": "-sn -PR --max-retries 1 --host-timeout 8s",
 
-            # Vulnerability Scanning Settings
+            # Lists
+            "__title_lists__": "List Settings",
+            "steal_file_names": ["ssh.csv", "hack.txt"],
+            "steal_file_extensions": [".bjorn", ".hack", ".flag"],
+            "ignored_smb_shares": ["print$", "ADMIN$", "IPC$"],
+
+            # Vulnerability scanning
+            "__title_vuln__": "Vulnerability Scanning",
             "vuln_fast": True,
             "nse_vulners": True,
             "vuln_max_ports": 25,
-            "vuln_rescan_on_change_only": False,   # (facultatif: force un rescan)
+            "vuln_rescan_on_change_only": False,
             "vuln_rescan_ttl_seconds": 0,
+            "vuln_batch_size": 2,
+            "vuln_batch_pause_s": 0.5,
             "scan_cpe": True,
             "nvd_api_key": "",                 
             "exploitdb_repo_dir": "/home/bjorn/exploitdb",
             "exploitdb_enabled": True,
             "searchsploit_path": "/home/bjorn/exploitdb/searchsploit",   
-            "exploitdb_root": "/home/bjorn/exploitdb",                   # si cloné
+            "exploitdb_root": "/home/bjorn/exploitdb",
             "kev_feed_url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
             "epss_api": "https://api.first.org/data/v1/epss?cve=",
 
-            #Actions Studio Settings
+            # Actions studio
             "__title_actions_studio__": "Actions Studio",
             "use_actions_studio": True,
 
-
-            # Action Timing Settings
-            "__title_timewaits__": "Time Wait Settings",
+            # Action timings / probes
+            "__title_timewaits__": "Action Timing Settings",
             "timewait_smb": 0,
             "timewait_ssh": 0,
             "timewait_telnet": 0,
             "timewait_ftp": 0,
             "timewait_sql": 0,
+            "ssh_connect_timeout_s": 6.0,
+            "ftp_connect_timeout_s": 3.0,
+            "telnet_connect_timeout_s": 6.0,
+            "sql_connect_timeout_s": 6.0,
+            "smb_connect_timeout_s": 6.0,
+            "web_probe_timeout_s": 4.0,
+            "web_probe_user_agent": "BjornWebProfiler/1.0",
+            "web_login_profiler_paths": [
+                "/",
+                "/login",
+                "/signin",
+                "/auth",
+                "/admin",
+                "/administrator",
+                "/wp-login.php",
+                "/user/login",
+                "/robots.txt",
+            ],
+            "web_probe_max_bytes": 65536,
+            "valkyrie_delay_s": 0.05,
+            "valkyrie_scout_paths": [
+                "/",
+                "/robots.txt",
+                "/login",
+                "/signin",
+                "/auth",
+                "/admin",
+                "/wp-login.php",
+            ],
+            "thor_connect_timeout_s": 1.5,
+            "thor_banner_max_bytes": 1024,
+            "thor_source": "thor_hammer",
+
+            # Exhaustive bruteforce fallback
+            "__title_bruteforce__": "Bruteforce Exhaustive",
+            "bruteforce_exhaustive_enabled": False,
+            "bruteforce_exhaustive_min_length": 1,
+            "bruteforce_exhaustive_max_length": 4,
+            "bruteforce_exhaustive_max_candidates": 2000,
+            "bruteforce_exhaustive_lowercase": True,
+            "bruteforce_exhaustive_uppercase": True,
+            "bruteforce_exhaustive_digits": True,
+            "bruteforce_exhaustive_symbols": False,
+            "bruteforce_exhaustive_symbols_chars": "!@#$%^&*",
+            "bruteforce_exhaustive_require_mix": False,
         }
+
+    @property
+    def operation_mode(self) -> str:
+        """
+        Get current operation mode: 'MANUAL', 'AUTO', or 'AI'.
+        Abstracts legacy manual_mode and ai_mode flags.
+        """
+        if getattr(self, "manual_mode", False):
+            return "MANUAL"
+        if getattr(self, "ai_mode", False):
+            return "AI"
+        return "AUTO"
+
+    @property
+    def bjorn_instance(self):
+        """Access the supervisor Bjorn instance via weak reference."""
+        return self._bjorn_ref() if self._bjorn_ref else None
+
+    @bjorn_instance.setter
+    def bjorn_instance(self, instance):
+        if instance is None:
+            self._bjorn_ref = None
+        else:
+            self._bjorn_ref = weakref.ref(instance)
+
+    @property
+    def config_json(self) -> str:
+        """Get configuration as a JSON string (Cached for performance)."""
+        with self.config_lock:
+            # Re-serialize only if not cached. 
+            # In a real app we'd check if self.config was modified, 
+            # but for Pi Zero simplicity, we mostly rely on this for repeated web probes.
+            if self._config_json_cache is None:
+                self._config_json_cache = json.dumps(self.config)
+            return self._config_json_cache
+
+    def invalidate_config_cache(self):
+        """Invalidate the JSON config cache after modifications."""
+        self._config_json_cache = None
+
+    @operation_mode.setter
+    def operation_mode(self, mode: str):
+        """
+        Set operation mode: 'MANUAL', 'AUTO', or 'AI'.
+        Updates legacy flags for backward compatibility.
+        """
+        mode = str(mode or "").upper().strip()
+        if mode not in ("MANUAL", "AUTO", "AI"):
+            return
+
+        # No-op if already in this mode (prevents log spam and redundant work).
+        try:
+            if mode == self.operation_mode:
+                return
+        except Exception:
+            pass
+
+        if mode == "MANUAL":
+            self.config["manual_mode"] = True
+            # ai_mode state doesn't strictly matter in manual, but keep it clean
+            self.manual_mode = True
+            self.ai_mode = False
+        elif mode == "AI":
+            self.config["manual_mode"] = False
+            self.config["ai_mode"] = True
+            self.manual_mode = False
+            self.ai_mode = True # Update attribute if it exists
+        elif mode == "AUTO":
+            self.config["manual_mode"] = False
+            self.config["ai_mode"] = False
+            self.manual_mode = False
+            self.ai_mode = False
+        
+        # Ensure config reflects attributes (two-way sync usually handled by load_config but we do it here for setters)
+        self.config["manual_mode"] = self.manual_mode
+        self.config["ai_mode"] = getattr(self, "ai_mode", False)
+        
+        self.invalidate_config_cache()
+        logger.info(f"Operation mode switched to: {mode}")
 
     def get_actions_config(self) -> List[Dict[str, Any]]:
         """Return actions configuration from database"""
@@ -278,30 +529,30 @@ class SharedData:
         self._add_to_blacklist('hostname_scan_blacklist', bjorn_hostname, 'hostname')
 
     def _add_to_blacklist(self, blacklist_key: str, value: str, value_type: str):
-        """Add value to specified blacklist"""
-        if blacklist_key not in self.config:
-            self.config[blacklist_key] = []
-        
-        if value not in self.config[blacklist_key]:
-            self.config[blacklist_key].append(value)
-            logger.info(f"Added {value_type} {value} to blacklist")
-        else:
-            logger.info(f"{value_type} {value} already in blacklist")
+        """Add value to specified blacklist (Thread-safe)"""
+        with self.config_lock:
+            if blacklist_key not in self.config:
+                self.config[blacklist_key] = []
+            
+            if value not in self.config[blacklist_key]:
+                self.config[blacklist_key].append(value)
+                logger.info(f"Added {value_type} {value} to blacklist")
+            else:
+                logger.info(f"{value_type} {value} already in blacklist")
 
     def get_raspberry_mac(self) -> Optional[str]:
         """Get MAC address of primary network interface"""
         try:
-            # Try wireless interface first
-            result = subprocess.run(['cat', '/sys/class/net/wlan0/address'], 
-                                 capture_output=True, text=True)
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip().lower()
-            
-            # Fallback to ethernet interface
-            result = subprocess.run(['cat', '/sys/class/net/eth0/address'], 
-                                 capture_output=True, text=True)
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip().lower()
+            for path in ("/sys/class/net/wlan0/address", "/sys/class/net/eth0/address"):
+                if not os.path.exists(path):
+                    continue
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        mac = fh.read().strip().lower()
+                        if mac:
+                            return mac
+                except Exception as read_error:
+                    logger.debug(f"Could not read {path}: {read_error}")
             
             logger.warning("Could not find MAC address for wlan0 or eth0")
             return None
@@ -321,11 +572,22 @@ class SharedData:
 
     def initialize_epd_display(self):
         """Initialize e-paper display"""
+        if not self.config.get("epd_enabled", True):
+            self.epd = None
+            self.width = int(self.config.get("ref_width", 122))
+            self.height = int(self.config.get("ref_height", 250))
+            self.ref_width = self.config.get('ref_width', 122)
+            self.ref_height = self.config.get('ref_height', 250)
+            self.scale_factor_x = self.width / self.ref_width
+            self.scale_factor_y = self.height / self.ref_height
+            logger.info("EPD disabled by config - running in headless mode")
+            return
+
         try:
             logger.info("Initializing EPD display...")
             time.sleep(1)
 
-            # Utiliser le manager au lieu de l’ancien helper
+            # Use Manager instead of Helper
             self.epd = EPDManager(self.config["epd_type"])
 
             # Config orientation
@@ -339,7 +601,7 @@ class SharedData:
                 self.screen_reversed, self.web_screen_reversed = epd_configs[self.config["epd_type"]]
                 logger.info(f"EPD type: {self.config['epd_type']} - reversed: {self.screen_reversed}")
 
-            # Init hardware une fois
+            # Init hardware once
             self.epd.init_full_update()
             self.width, self.height = self.epd.epd.width, self.epd.epd.height
 
@@ -353,7 +615,15 @@ class SharedData:
 
         except Exception as e:
             logger.error(f"Error initializing EPD display: {e}")
-            raise
+            self.epd = None
+            self.config["epd_enabled"] = False
+            self.width = int(self.config.get("ref_width", 122))
+            self.height = int(self.config.get("ref_height", 250))
+            self.ref_width = self.config.get('ref_width', 122)
+            self.ref_height = self.config.get('ref_height', 250)
+            self.scale_factor_x = self.width / self.ref_width
+            self.scale_factor_y = self.height / self.ref_height
+            logger.warning("Falling back to headless mode after EPD init failure")
 
 
     def initialize_runtime_variables(self):
@@ -374,6 +644,9 @@ class SharedData:
         self.ethernet_active = False
         self.pan_connected = False
         self.usb_active = False
+        self.current_ip = "No IP"
+        self.action_target_ip = ""
+        self.current_ssid = "No Wi-Fi"
         
         # Display state
         self.bjorn_character = None
@@ -385,6 +658,12 @@ class SharedData:
         self.bjorn_status_text2 = "Awakening..."
         self.bjorn_progress = ""
         
+        # --- NEW: AI / RL Real-Time Tracking ---
+        self.active_action = None
+        self.last_decision_method = "heuristic" # 'neural_network', 'heuristic', 'exploration'
+        self.last_ai_decision = {} # Stores all_scores, input_vector, manifest
+        self.ai_update_event = threading.Event()
+        
         # UI positioning
         self.text_frame_top = int(88 * self.scale_factor_x)
         self.text_frame_bottom = int(159 * self.scale_factor_y)
@@ -392,6 +671,13 @@ class SharedData:
         
         # Statistics
         self.battery_status = 26
+        self.battery_percent = 26
+        self.battery_voltage = None
+        self.battery_is_charging = False
+        self.battery_present = False
+        self.battery_source = "unknown"
+        self.battery_last_update = 0.0
+        self.battery_probe_failures = 0
         self.target_count = 0
         self.port_count = 0
         self.vuln_count = 0
@@ -403,13 +689,19 @@ class SharedData:
         self.network_kb_count = 0
         self.attacks_count = 0
         
+        # System Resources (Cached)
+        self.system_cpu = 0
+        self.system_mem = 0
+        self.system_mem_used = 0
+        self.system_mem_total = 0
+        
         # Display control
         self.show_first_image = True
         
-        # Threading
-        self.scripts_lock = threading.Lock()
+        # Threading Containers
         self.running_scripts = {}
-        self.output_lock = threading.Lock()
+        self.display_runtime_metrics = {}
+        self.health_metrics = {}
         
         # URLs
         self.github_version_url = "https://raw.githubusercontent.com/infinition/Bjorn/main/version.txt"
@@ -467,14 +759,13 @@ class SharedData:
                 actions_config.append(meta)
 
                 # Status tracking
-                if meta["b_class"] not in self.status_list:
-                    self.status_list.append(meta["b_class"])
+                self.status_list.add(meta["b_class"])
 
             if actions_config:
                 self.db.sync_actions(actions_config)
                 logger.info(f"Synchronized {len(actions_config)} actions to database")
 
-            # Garde actions_studio alignée
+            # Keep actions_studio aligned
             try:
                 self.db._sync_actions_studio_schema_and_rows()
                 logger.info("actions_studio schema/rows synced (non-destructive)")
@@ -484,11 +775,10 @@ class SharedData:
         except Exception as e:
             logger.error(f"Error syncing actions to database: {e}")
 
-
     def _extract_action_metadata(self, filepath: str) -> Optional[Dict[str, Any]]:
         """Extract action metadata from Python file using AST parsing (Safe)"""
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
+            with open(filepath, "r", encoding="utf-8-sig") as f:
                 tree = ast.parse(f.read(), filename=filepath)
             
             meta = {}
@@ -501,7 +791,6 @@ class SharedData:
                                 val = ast.literal_eval(node.value)
                                 meta[key] = val
                             except (ValueError, SyntaxError):
-                                logger.warning(f"Could not safe-eval variable {key} in {filepath}. Use literals only.")
                                 pass
             
             # Set default module name if not specified
@@ -514,10 +803,6 @@ class SharedData:
             logger.error(f"Failed to parse {filepath}: {e}")
             return None
 
-    # ... (le reste des méthodes initialize_database, load_config, etc. reste inchangé) ...
-    # Assurez-vous d'inclure les autres méthodes existantes de la classe SharedData ici.
-    # Pour la brièveté de la réponse, je ne répète pas les méthodes non modifiées si elles sont identiques au fichier original.
-    # [INCLURE LE RESTE DU FICHIER SHARED.PY ORIGINAL ICI]
     def initialize_database(self):
         """Initialize database schema"""
         logger.info("Initializing database schema")
@@ -529,43 +814,33 @@ class SharedData:
                 actions = self.db.list_actions()
                 for action in actions:
                     if action.get("b_class"):
-                        self.status_list.append(action["b_class"])
+                        self.status_list.add(action["b_class"])
                         
         except Exception as e:
             logger.error(f"Error initializing database: {e}")
 
     def load_config(self):
-        """Load configuration from database"""
-        try:
-            logger.info("Loading configuration from database")
-            cfg = self.db.get_config()
-            
-            if not cfg:
-                # Seed with defaults
-                self.db.save_config(self.default_config.copy())
-                cfg = self.db.get_config() or {}
-            
-            # Merge with current config
-            self.config.update(cfg)
-            
-            # Expose config as attributes for backward compatibility
-            for key, value in self.config.items():
-                setattr(self, key, value)
-                
-        except Exception as e:
-            logger.error(f"Error loading configuration: {e}")
-            # Fallback to defaults
-            for key, value in self.config.items():
-                setattr(self, key, value)
+        """Load configuration from DB (Thread-safe)"""
+        with self.config_lock: 
+            try:
+                cfg = self.db.get_config()
+                if not cfg:
+                    self.db.save_config(self.default_config.copy())
+                    cfg = self.db.get_config() or {}
+                self.config.update(cfg)
+                for key, value in self.config.items():
+                    setattr(self, key, value)
+            except Exception as e:
+                logger.error(f"Error loading configuration: {e}")
 
     def save_config(self):
-        """Save configuration to database"""
-        logger.info("Saving configuration to database")
-        try:
-            self.db.save_config(self.config)
-            logger.info("Configuration saved successfully")
-        except Exception as e:
-            logger.error(f"Error saving configuration: {e}")
+        """Save configuration to DB (Thread-safe)"""
+        with self.config_lock:
+            try:
+                self.db.save_config(self.config)
+                self.invalidate_config_cache()
+            except Exception as e:
+                logger.error(f"Error saving configuration: {e}")
 
     def load_fonts(self):
         """Load font resources"""
@@ -579,7 +854,10 @@ class SharedData:
             # Load font sizes
             self.font_arial14 = self._load_font(self.default_font_path, 14)
             self.font_arial11 = self._load_font(self.default_font_path, 11)
+            self.font_arial10 = self._load_font(self.default_font_path, 10)
             self.font_arial9 = self._load_font(self.default_font_path, 9)
+            self.font_arial8 = self._load_font(self.default_font_path, 8)
+            self.font_arial7 = self._load_font(self.default_font_path, 7)
             self.font_arialbold = self._load_font(self.default_font_path, 12)
             
             # Viking font for title
@@ -598,33 +876,39 @@ class SharedData:
             return ImageFont.truetype(font_path, size)
         except Exception as e:
             logger.error(f"Error loading font {font_path}: {e}")
-            raise
+            return ImageFont.load_default()
+
+    # =========================================================================
+    # IMAGE MANAGEMENT (LAZY LOADING EDITION)
+    # Optimizes RAM by indexing paths instead of loading all pixels at once
+    # =========================================================================
 
     def load_images(self):
-        """Load image resources for display"""
+        """Initialize images: load static ones to RAM, index status paths for lazy loading"""
         try:
-            logger.info("Loading images")
-            
-            # Initialize status image
+            logger.info("SharedData: Indexing images (Lazy Loading Mode)")
             self.bjorn_status_image = None
             
-            # Load static images
+            # Load static images (keep in RAM, they are small and used constantly)
             self._load_static_images()
             
-            # Load status images
-            self._load_status_images()
+            # Set default character from static images
+            self.bjorn_character = getattr(self, 'bjorn1', None)
+            
+            # Index status images (don't load pixels yet)
+            self._index_status_images()
             
             # Calculate display positions
             self._calculate_image_positions()
             
-            logger.info("Images loaded successfully")
+            logger.info("Images indexed successfully")
             
         except Exception as e:
-            logger.error(f"Error loading images: {e}")
+            logger.error(f"Error indexing images: {e}")
             raise
 
     def _load_static_images(self):
-        """Load static UI images"""
+        """Load static UI images into RAM"""
         static_images = {
             'bjorn1': 'bjorn1.bmp',
             'port': 'port.bmp',
@@ -658,9 +942,10 @@ class SharedData:
             image_path = os.path.join(self.static_images_dir, filename)
             setattr(self, attr_name, self._load_image(image_path))
 
-    def _load_status_images(self):
-        """Load status-specific images and image series"""
-        self.image_series = {}
+    def _index_status_images(self):
+        """Index file paths for animations instead of loading them into RAM"""
+        self.image_series_paths = {} 
+        self.main_status_paths = {}
         
         try:
             # Load images from database actions
@@ -668,113 +953,119 @@ class SharedData:
             for action in actions:
                 b_class = action.get('b_class')
                 if b_class:
-                    # Load individual status image
+                    # Index main status image path
                     status_dir = os.path.join(self.status_images_dir, b_class)
-                    image_path = os.path.join(status_dir, f'{b_class}.bmp')
-                    image = self._load_image(image_path)
-                    setattr(self, b_class, image)
+                    main_img_path = os.path.join(status_dir, f'{b_class}.bmp')
+                    self.main_status_paths[b_class] = main_img_path
                     
-                    if b_class not in self.status_list:
-                        self.status_list.append(b_class)
+                    self.status_list.add(b_class)
                     
-                    # Load image series for animations
-                    self.image_series[b_class] = []
-                    if not os.path.isdir(status_dir):
-                        os.makedirs(status_dir, exist_ok=True)
-                        logger.warning(f"Created missing directory: {status_dir}")
-                    
-                    # Load numbered images for animation
-                    for image_name in os.listdir(status_dir):
-                        if image_name.endswith('.bmp') and re.search(r'\d', image_name):
-                            series_image = self._load_image(os.path.join(status_dir, image_name))
-                            if series_image:
-                                self.image_series[b_class].append(series_image)
-                    
-                    logger.info(f"Loaded {len(self.image_series.get(b_class, []))} images for {b_class}")
+                    # Index animation frames paths
+                    self.image_series_paths[b_class] = []
+                    if os.path.isdir(status_dir):
+                        for image_name in os.listdir(status_dir):
+                            if image_name.endswith('.bmp') and re.search(r'\d', image_name):
+                                self.image_series_paths[b_class].append(os.path.join(status_dir, image_name))
+                    else:
+                        # Create missing directory safely
+                        try:
+                            os.makedirs(status_dir, exist_ok=True)
+                        except: pass
+
+            logger.info(f"Indexed {len(self.image_series_paths)} status categories")
                     
         except Exception as e:
-            logger.error(f"Error loading status images: {e}")
-        
-        # Ensure IDLE images exist as fallback
-        if not self.image_series:
-            logger.error("No image series loaded")
-        else:
-            for status, images in self.image_series.items():
-                logger.info(f"Status {status}: {len(images)} animation frames")
+            logger.error(f"Error indexing status images: {e}")
 
     def _load_image(self, image_path: str) -> Optional[Image.Image]:
-        """Load a single image file"""
+        """Load a single image file safely and release file descriptor immediately"""
         try:
             if not os.path.exists(image_path):
-                logger.warning(f"Image not found: {image_path}")
+                # Only warn if it's not a lazy-load check
                 return None
-            return Image.open(image_path)
+            
+            # Force pixel load and detach from file handle to avoid FD leaks.
+            with Image.open(image_path) as img:
+                loaded = img.copy()
+            return loaded
         except Exception as e:
             logger.error(f"Error loading image {image_path}: {e}")
             return None
 
     def _calculate_image_positions(self):
         """Calculate image positions for display centering"""
-        if self.bjorn1:
+        if hasattr(self, 'bjorn1') and self.bjorn1:
             self.x_center1 = (self.width - self.bjorn1.width) // 2
             self.y_bottom1 = self.height - self.bjorn1.height
 
     def update_bjorn_status(self):
-        """Update current status image"""
+        """Lazy Load the main status image when status changes"""
         try:
-            self.bjorn_status_image = getattr(self, self.bjorn_orch_status, None)
-            if self.bjorn_status_image is None:
-                logger.warning(f"Image for status {self.bjorn_orch_status} not available, using default")
+            # Try to load from indexed paths
+            path = self.main_status_paths.get(self.bjorn_orch_status)
+            
+            if path and os.path.exists(path):
+                self.bjorn_status_image = self._load_image(path)
+            else:
+                # Fallback to attack image
+                logger.warning(f"Image for status {self.bjorn_orch_status} not found, using default")
                 self.bjorn_status_image = self.attack
-        except AttributeError:
-            logger.warning(f"Status {self.bjorn_orch_status} not found, using IDLE")
+                
+        except Exception:
             self.bjorn_status_image = self.attack
         
         self.bjorn_status_text = self.bjorn_orch_status
 
     def update_image_randomizer(self):
-        """Select random image from current status series"""
+        """Select random image path and Lazy Load it"""
         try:
             status = self.bjorn_status_text
             
-            # Try to get images for current status
-            if status in self.image_series and self.image_series[status]:
-                images = self.image_series[status]
-            # Fallback to IDLE images
-            elif "IDLE" in self.image_series and self.image_series["IDLE"]:
-                logger.warning(f"No images for {status}, using IDLE")
-                images = self.image_series["IDLE"]
-            else:
-                logger.error("No images available")
+            # Get list of paths for current status
+            paths = self.image_series_paths.get(status)
+            
+            # Fallback to IDLE if empty or non-existent
+            if not paths and "IDLE" in self.image_series_paths:
+                paths = self.image_series_paths["IDLE"]
+            
+            if not paths:
                 self.imagegen = None
                 return
+
+            # Select random file path
+            random_path = random.choice(paths)
             
-            # Select random image
-            random_index = random.randint(0, len(images) - 1)
-            self.imagegen = images[random_index]
+            # Load specific frame
+            self.imagegen = self._load_image(random_path)
             
-            # Calculate centering
-            self.x_center = (self.width - self.imagegen.width) // 2
-            self.y_bottom = self.height - self.imagegen.height
+            if self.imagegen:
+                # Calculate centering
+                self.x_center = (self.width - self.imagegen.width) // 2
+                self.y_bottom = self.height - self.imagegen.height
             
         except Exception as e:
             logger.error(f"Error updating image randomizer: {e}")
             self.imagegen = None
 
     def wrap_text(self, text: str, font: ImageFont.FreeTypeFont, max_width: int) -> List[str]:
-        """Wrap text to fit within specified width"""
+        """Wrap text to fit within specified width — boucle infinie protégée."""
         try:
             lines = []
             words = text.split()
-            
+            if not words:
+                return [""]
+
             while words:
                 line = []
+                # Toujours ajouter au moins 1 mot même s'il dépasse max_width
+                # sinon si le mot seul > max_width → boucle infinie garantie
+                line.append(words.pop(0))
                 while words and font.getlength(' '.join(line + [words[0]])) <= max_width:
                     line.append(words.pop(0))
-                lines.append(' '.join(line).strip())
-            
-            return lines
-            
+                lines.append(' '.join(line))
+
+            return lines if lines else [text]
+
         except Exception as e:
             logger.error(f"Error wrapping text: {e}")
             return [text]
@@ -799,7 +1090,233 @@ class SharedData:
             self.vuln_count * 0.01
         )
 
+    # =========================================================================
+    # BATTERY MANAGEMENT (ROBUST PISUGAR/SYSFS LOGIC)
+    # =========================================================================
+
+    def _extract_first_float(self, text: Optional[str]) -> Optional[float]:
+        if not text:
+            return None
+        try:
+            # PiSugar responses may use either '.' or ',' as decimal separator.
+            text_normalized = str(text).replace(",", ".")
+            m = re.search(r"[-+]?\d+(?:\.\d+)?", text_normalized)
+            if not m:
+                return None
+            return float(m.group(0))
+        except Exception:
+            return None
+
+    def _parse_bool_reply(self, text: Optional[str]) -> Optional[bool]:
+        if text is None:
+            return None
+        s = str(text).strip().lower()
+        if "true" in s:
+            return True
+        if "false" in s:
+            return False
+        n = self._extract_first_float(s)
+        if n is None:
+            return None
+        return bool(int(n))
+
+    def _pisugar_send_command(self, command: str, timeout_s: float = 1.0) -> Optional[str]:
+        if not self.config.get("pisugar_enabled", True):
+            return None
+
+        timeout_s = float(self.config.get("pisugar_timeout_s", timeout_s))
+        payload = (command.strip() + "\n").encode("utf-8")
+
+        sock_path = str(self.config.get("pisugar_socket_path", "/tmp/pisugar-server.sock"))
+        try:
+            if os.path.exists(sock_path):
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                    s.settimeout(timeout_s)
+                    s.connect(sock_path)
+                    s.sendall(payload)
+                    return s.recv(1024).decode("utf-8", errors="ignore").strip()
+        except Exception:
+            pass
+
+        host = str(self.config.get("pisugar_tcp_host", "127.0.0.1"))
+        port = int(self.config.get("pisugar_tcp_port", 8423))
+        try:
+            with socket.create_connection((host, port), timeout=timeout_s) as s:
+                s.settimeout(timeout_s)
+                s.sendall(payload)
+                return s.recv(1024).decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return None
+
+    def _pisugar_battery_probe(self) -> Optional[Dict[str, Any]]:
+        battery_raw = self._pisugar_send_command("get battery")
+        if not battery_raw:
+            return None
+
+        level_float = self._extract_first_float(battery_raw)
+        if level_float is None:
+            return None
+        level_pct = max(0, min(100, int(round(level_float))))
+
+        voltage_raw = self._pisugar_send_command("get battery_v")
+        plugged_raw = self._pisugar_send_command("get battery_power_plugged")
+        allow_charging_raw = self._pisugar_send_command("get battery_allow_charging")
+        charging_raw = self._pisugar_send_command("get battery_charging")
+
+        charging = self._parse_bool_reply(charging_raw)
+        if charging is None:
+            plugged = self._parse_bool_reply(plugged_raw)
+            allow_charging = self._parse_bool_reply(allow_charging_raw)
+            if plugged is not None and allow_charging is not None:
+                charging = plugged and allow_charging
+            elif plugged is not None:
+                charging = plugged
+            else:
+                charging = False
+
+        voltage = self._extract_first_float(voltage_raw)
+
+        return {
+            "present": True,
+            "level_pct": level_pct,
+            "charging": bool(charging),
+            "voltage": voltage,
+            "source": "pisugar",
+        }
+
+    def _sysfs_battery_probe(self) -> Optional[Dict[str, Any]]:
+        try:
+            base = "/sys/class/power_supply"
+            if not os.path.isdir(base):
+                return None
+
+            bat_dir = None
+            for entry in os.listdir(base):
+                if entry.startswith("BAT"):
+                    bat_dir = os.path.join(base, entry)
+                    break
+            if not bat_dir:
+                return None
+
+            cap_path = os.path.join(bat_dir, "capacity")
+            status_path = os.path.join(bat_dir, "status")
+            volt_path = os.path.join(bat_dir, "voltage_now")
+
+            level_pct = None
+            if os.path.exists(cap_path):
+                with open(cap_path, "r", encoding="utf-8") as f:
+                    cap_txt = f.read().strip()
+                    if cap_txt.isdigit():
+                        level_pct = max(0, min(100, int(cap_txt)))
+            if level_pct is None:
+                return None
+
+            charging = False
+            if os.path.exists(status_path):
+                with open(status_path, "r", encoding="utf-8") as f:
+                    st = f.read().strip().lower()
+                    charging = st.startswith("char") or st.startswith("full")
+
+            voltage = None
+            if os.path.exists(volt_path):
+                with open(volt_path, "r", encoding="utf-8") as f:
+                    raw = f.read().strip()
+                    n = self._extract_first_float(raw)
+                    if n is not None:
+                        # Common sysfs format: microvolts
+                        voltage = n / 1_000_000 if n > 1000 else n
+
+            return {
+                "present": True,
+                "level_pct": level_pct,
+                "charging": bool(charging),
+                "voltage": voltage,
+                "source": "sysfs",
+            }
+        except Exception:
+            return None
+
+    def update_battery_status(self) -> bool:
+        """
+        Refresh battery metrics from PiSugar (preferred) or sysfs fallback.
+        battery_status convention:
+          - 0..100 => discharge level
+          - 101    => charging icon on EPD
+        """
+        now = time.time()
+        failures_before_none = max(1, int(self.config.get("battery_probe_failures_before_none", 4)))
+        grace_seconds = max(0.0, float(self.config.get("battery_probe_grace_seconds", 120)))
+        
+        data = self._pisugar_battery_probe() or self._sysfs_battery_probe()
+        
+        if not data:
+            self.battery_probe_failures = int(getattr(self, "battery_probe_failures", 0)) + 1
+            last_ok = float(getattr(self, "battery_last_update", 0.0))
+            had_recent_sample = last_ok > 0 and (now - last_ok) <= grace_seconds
+            
+            if had_recent_sample and bool(getattr(self, "battery_present", False)):
+                return False
+
+            if self.battery_probe_failures >= failures_before_none:
+                self.battery_present = False
+                self.battery_is_charging = False
+                self.battery_source = "none"
+                self.battery_status = 0
+                self.battery_last_update = now
+            return False
+            
+        recovered_after_failures = self.battery_probe_failures > 0
+        self.battery_probe_failures = 0
+
+        level_pct = int(data.get("level_pct", self.battery_percent))
+        charging = bool(data.get("charging", False))
+        voltage = data.get("voltage")
+
+        self.battery_present = bool(data.get("present", True))
+        self.battery_percent = max(0, min(100, level_pct))
+        self.battery_is_charging = charging
+        self.battery_voltage = float(voltage) if voltage is not None else None
+        self.battery_source = str(data.get("source", "unknown"))
+        self.battery_last_update = now
+        self.battery_status = 101 if charging else self.battery_percent
+        
+        if recovered_after_failures:
+            logger.info(f"Battery probe recovered: source={self.battery_source}")
+
+        return True
+
     def debug_print(self, message: str):
         """Print debug message if debug mode is enabled"""
         if self.config.get('debug_mode', False):
             logger.debug(message)
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get current system status (Thread-safe)"""
+        with self.status_lock:
+            return self.curr_status.copy()
+
+    def update_status(self, status: str, details: str = ""):
+        """Update system status (Thread-safe)"""
+        with self.status_lock:
+            self.curr_status = {
+                "status": status,
+                "details": details,
+                "timestamp": time.time()
+            }
+
+    def log_milestone(self, action_name: str, phase: str, details: str = ""):
+        """
+        Broadcasting real-time milestones to the web console and logs.
+        Used for granular progress tracking in the UI.
+        """
+        milestone_data = {
+            "action": action_name,
+            "phase": phase,
+            "details": details,
+            "timestamp": datetime.now().strftime("%H:%M:%S")
+        }
+        logger.info(f"[MILESTONE] {json.dumps(milestone_data)}")
+        
+        # Also update internal state for immediate access
+        self.active_action = action_name
+        self.bjorn_status_text2 = f"{phase}: {details}" if details else phase

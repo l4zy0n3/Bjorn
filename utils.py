@@ -20,7 +20,8 @@ class WebUtils:
         "studio_utils": ("web_utils.studio_utils", "StudioUtils"),
         "db_utils": ("web_utils.db_utils", "DBUtils"),
         "action_utils": ("web_utils.action_utils", "ActionUtils"),
-
+        "rl": ("web_utils.rl_utils", "RLUtils"),
+        "debug_utils": ("web_utils.debug_utils", "DebugUtils"),
     }
 
 

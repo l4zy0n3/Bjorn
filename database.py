@@ -156,6 +156,15 @@ class BjornDatabase:
         return self._config.save_config(config)
     
     # Host operations
+    def get_host_by_mac(self, mac_address: str) -> Optional[Dict[str, Any]]:
+        """Get a single host by MAC address"""
+        try:
+            results = self.query("SELECT * FROM hosts WHERE mac_address=? LIMIT 1", (mac_address,))
+            return results[0] if results else None
+        except Exception as e:
+            logger.error(f"Error getting host by MAC {mac_address}: {e}")
+            return None
+
     def get_all_hosts(self) -> List[Dict[str, Any]]:
         return self._hosts.get_all_hosts()
     
@@ -519,6 +528,21 @@ class BjornDatabase:
     def vacuum(self) -> None:
         """Vacuum the database"""
         return self._base.vacuum()
+
+    def close(self) -> None:
+        """Close database connection gracefully."""
+        try:
+            with self._lock:
+                if hasattr(self, "_base") and self._base:
+                    # DatabaseBase handles the actual connection closure
+                    if hasattr(self._base, "_conn") and self._base._conn:
+                        self._base._conn.close()
+            logger.info("BjornDatabase connection closed")
+        except Exception as e:
+            logger.debug(f"Error during database closure (ignorable if already closed): {e}")
+
+    # Removed __del__ as it can cause circular reference leaks and is not guaranteed to run.
+    # Lifecycle should be managed by explicit close() calls.
     
     # Internal helper methods used by modules
     def _table_exists(self, name: str) -> bool:

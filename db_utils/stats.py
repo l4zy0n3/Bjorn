@@ -71,10 +71,8 @@ class StatsOps:
     
     def get_stats(self) -> Dict[str, int]:
         """Compatibility alias to retrieve stats; ensures the singleton row exists"""
+        self.ensure_stats_initialized()
         row = self.base.query("SELECT total_open_ports, alive_hosts_count, all_known_hosts_count, vulnerabilities_count FROM stats WHERE id=1;")
-        if not row:
-            self.ensure_stats_initialized()
-            row = self.base.query("SELECT total_open_ports, alive_hosts_count, all_known_hosts_count, vulnerabilities_count FROM stats WHERE id=1;")
         r = row[0]
         return {
             "total_open_ports": int(r["total_open_ports"]),

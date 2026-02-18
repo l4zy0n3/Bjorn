@@ -10,7 +10,8 @@ PresenceJoin — Sends a Discord webhook when the targeted host JOINS the networ
 import requests
 from typing import Optional
 import logging
-from datetime import datetime, timezone
+import datetime
+
 from logger import Logger
 from shared import SharedData  # only if executed directly for testing
 
@@ -29,19 +30,19 @@ b_rate_limit = None
 b_trigger    = "on_join"      # <-- Host JOINED the network (OFF -> ON since last scan)
 b_requires   = {"any":[{"mac_is":"60:57:c8:51:63:fb"}]}  # adapt as needed
 
-# Replace with your webhook
-DISCORD_WEBHOOK_URL = "https://discordapp.com/api/webhooks/1416433823456956561/MYc2mHuqgK_U8tA96fs2_-S1NVchPzGOzan9EgLr4i8yOQa-3xJ6Z-vMejVrpPfC3OfD"
+DISCORD_WEBHOOK_URL = ""  # Configure via shared_data or DB
 
 class PresenceJoin:
     def __init__(self, shared_data):
         self.shared_data = shared_data
 
     def _send(self, text: str) -> None:
-        if not DISCORD_WEBHOOK_URL or "webhooks/" not in DISCORD_WEBHOOK_URL:
+        url = getattr(self.shared_data, 'discord_webhook_url', None) or DISCORD_WEBHOOK_URL
+        if not url or "webhooks/" not in url:
             logger.error("PresenceJoin: DISCORD_WEBHOOK_URL missing/invalid.")
             return
         try:
-            r = requests.post(DISCORD_WEBHOOK_URL, json={"content": text}, timeout=6)
+            r = requests.post(url, json={"content": text}, timeout=6)
             if r.status_code < 300:
                 logger.info("PresenceJoin: webhook sent.")
             else:
@@ -61,7 +62,8 @@ class PresenceJoin:
             ip_s = (ip or (row.get("IPs") or "").split(";")[0] or "").strip()
             
             # Add timestamp in UTC
-            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
             
             msg  = f"✅ **Presence detected**\n"
             msg += f"- Host: {host or 'unknown'}\n"

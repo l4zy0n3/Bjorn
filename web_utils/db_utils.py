@@ -33,16 +33,11 @@ class DBUtils:
     def _db_table_info(self, table: str):
         """Get table info (primary key and columns)."""
         table = self._db_safe_ident(table)
-        cols = [r["name"] for r in self.shared_data.db.query(f"PRAGMA table_info({table});")]
-        if not cols:
+        rows = self.shared_data.db.query(f"PRAGMA table_info({table});")
+        if not rows:
             raise ValueError("Table not found")
-        
-        pk = None
-        for r in self.shared_data.db.query(f"PRAGMA table_info({table});"):
-            if int(r["pk"] or 0) == 1:
-                pk = r["name"]
-                break
-        
+        cols = [r["name"] for r in rows]
+        pk = next((r["name"] for r in rows if int(r["pk"] or 0) == 1), None)
         if not pk:
             pk = "id" if "id" in cols else cols[0]
         return pk, cols

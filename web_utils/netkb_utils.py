@@ -94,20 +94,21 @@ class NetKBUtils:
     def serve_network_data(self, handler):
         """Serve network data as HTML table."""
         try:
-            html = ['<table><tr><th>ESSID</th><th>IP</th><th>Hostname</th><th>MAC Address</th><th>Vendor</th><th>Ports</th></tr>']
+            import html as _html
+            rows = ['<table><tr><th>ESSID</th><th>IP</th><th>Hostname</th><th>MAC Address</th><th>Vendor</th><th>Ports</th></tr>']
             for h in self.shared_data.db.get_all_hosts():
                 if int(h.get("alive") or 0) != 1:
                     continue
-                html.append(
-                    f"<tr><td>{h.get('essid', '')}</td>"
-                    f"<td>{h.get('ips', '')}</td>"
-                    f"<td>{h.get('hostnames', '')}</td>"
-                    f"<td>{h.get('mac_address', '')}</td>"
-                    f"<td>{h.get('vendor', '')}</td>"
-                    f"<td>{h.get('ports', '')}</td></tr>"
+                rows.append(
+                    f"<tr><td>{_html.escape(str(h.get('essid') or ''))}</td>"
+                    f"<td>{_html.escape(str(h.get('ips') or ''))}</td>"
+                    f"<td>{_html.escape(str(h.get('hostnames') or ''))}</td>"
+                    f"<td>{_html.escape(str(h.get('mac_address') or ''))}</td>"
+                    f"<td>{_html.escape(str(h.get('vendor') or ''))}</td>"
+                    f"<td>{_html.escape(str(h.get('ports') or ''))}</td></tr>"
                 )
-            html.append("</table>")
-            table_html = "\n".join(html)
+            rows.append("</table>")
+            table_html = "\n".join(rows)
             handler.send_response(200)
             handler.send_header("Content-type", "text/html")
             handler.end_headers()
@@ -193,7 +194,7 @@ class NetKBUtils:
             limit = int((qs.get("limit", ["200"])[0] or 200))
             include_superseded = (qs.get("include_superseded", ["true"])[0] or "true").lower() in ("1", "true", "yes", "on")
 
-            if not action or mac is None:
+            if not action or not mac:
                 raise ValueError("missing required parameters: action, mac")
 
             db = self.shared_data.db

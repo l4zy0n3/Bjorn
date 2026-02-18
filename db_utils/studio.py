@@ -22,6 +22,7 @@ class StudioOps:
         self.base.execute("""
             CREATE TABLE IF NOT EXISTS actions_studio (
                 b_class         TEXT PRIMARY KEY,
+                b_priority      INTEGER DEFAULT 50,
                 studio_x        REAL,
                 studio_y        REAL,
                 studio_locked   INTEGER DEFAULT 0,
@@ -31,6 +32,9 @@ class StudioOps:
             );
         """)
         
+        # Migration: ensure b_priority exists on pre-existing databases
+        self.base._ensure_column("actions_studio", "b_priority", "b_priority INTEGER DEFAULT 50")
+
         # Studio edges (relationships between actions)
         self.base.execute("""
             CREATE TABLE IF NOT EXISTS studio_edges (
@@ -255,6 +259,7 @@ class StudioOps:
         self.base.execute("""
             CREATE TABLE IF NOT EXISTS actions_studio (
                 b_class         TEXT PRIMARY KEY,
+                b_priority      INTEGER DEFAULT 50,
                 studio_x        REAL,
                 studio_y        REAL,
                 studio_locked   INTEGER DEFAULT 0,
@@ -282,10 +287,12 @@ class StudioOps:
         - Insert missing b_class entries
         - Update NULL fields only (non-destructive)
         """
-        # 1) Minimal table: PK + studio_* columns
+        # 1) Minimal table: PK + studio_* columns (b_priority must be here so
+        #    get_studio_actions() can ORDER BY it before _sync adds action columns)
         self.base.execute("""
             CREATE TABLE IF NOT EXISTS actions_studio (
                 b_class         TEXT PRIMARY KEY,
+                b_priority      INTEGER DEFAULT 50,
                 studio_x        REAL,
                 studio_y        REAL,
                 studio_locked   INTEGER DEFAULT 0,

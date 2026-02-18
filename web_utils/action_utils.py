@@ -17,7 +17,6 @@ This file merges previous modules:
 from __future__ import annotations
 
 import ast
-import cgi
 import io
 import json
 import os
@@ -38,6 +37,86 @@ from logger import Logger
 
 # Single shared logger for the whole file
 logger = Logger(name="action_utils.py", level=logging.DEBUG)
+
+
+# --- Multipart form helpers (replaces cgi module removed in Python 3.13) ---
+def _parse_header(line):
+    parts = line.split(';')
+    key = parts[0].strip()
+    pdict = {}
+    for p in parts[1:]:
+        if '=' in p:
+            k, v = p.strip().split('=', 1)
+            pdict[k.strip()] = v.strip().strip('"')
+    return key, pdict
+
+
+class _FormField:
+    __slots__ = ('name', 'filename', 'file', 'value')
+    def __init__(self, name, filename=None, data=b''):
+        self.name = name
+        self.filename = filename
+        if filename:
+            self.file = BytesIO(data)
+            self.value = data
+        else:
+            self.value = data.decode('utf-8', errors='replace').strip()
+            self.file = None
+
+
+class _MultipartForm:
+    """Minimal replacement for _MultipartForm."""
+    def __init__(self, fp, headers, environ=None, keep_blank_values=False):
+        import re as _re
+        self._fields = {}
+        ct = headers.get('Content-Type', '') if hasattr(headers, 'get') else ''
+        _, params = _parse_header(ct)
+        boundary = params.get('boundary', '').encode()
+        if hasattr(fp, 'read'):
+            cl = headers.get('Content-Length') if hasattr(headers, 'get') else None
+            body = fp.read(int(cl)) if cl else fp.read()
+        else:
+            body = fp
+        for part in body.split(b'--' + boundary)[1:]:
+            part = part.strip(b'\r\n')
+            if part == b'--' or not part:
+                continue
+            sep = b'\r\n\r\n' if b'\r\n\r\n' in part else b'\n\n'
+            if sep not in part:
+                continue
+            hdr, data = part.split(sep, 1)
+            hdr_s = hdr.decode('utf-8', errors='replace')
+            nm = _re.search(r'name="([^"]*)"', hdr_s)
+            fn = _re.search(r'filename="([^"]*)"', hdr_s)
+            if not nm:
+                continue
+            name = nm.group(1)
+            filename = fn.group(1) if fn else None
+            field = _FormField(name, filename, data)
+            if name in self._fields:
+                existing = self._fields[name]
+                if isinstance(existing, list):
+                    existing.append(field)
+                else:
+                    self._fields[name] = [existing, field]
+            else:
+                self._fields[name] = field
+
+    def __contains__(self, key):
+        return key in self._fields
+
+    def __getitem__(self, key):
+        return self._fields[key]
+
+    def getvalue(self, key, default=None):
+        if key not in self._fields:
+            return default
+        f = self._fields[key]
+        if isinstance(f, list):
+            return [x.value for x in f]
+        return f.value
+
+
 ALLOWED_IMAGE_EXTS = {'.bmp', '.png', '.jpg', '.jpeg', '.gif', '.ico', '.webp'}
 
 
@@ -169,7 +248,12 @@ class ActionUtils:
         except Exception:
             font = ImageFont.load_default()
 
-        tw, th = draw.textsize(text, font=font)
+        try:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+        except AttributeError:
+            tw, th = draw.textsize(text, font=font)
         draw.text(((size - tw) / 2, (size - th) / 2), text, fill=ring_color, font=font)
 
         out = BytesIO()
@@ -197,10 +281,16 @@ class ActionUtils:
 
     def serve_bjorn_character(self, handler):
         try:
-            # Convertir l'image PIL en bytes
+            # Fallback robust: use current character sprite, or static default "bjorn1"
+            img = self.shared_data.bjorn_character or getattr(self.shared_data, 'bjorn1', None)
+            
+            if img is None:
+                raise ValueError("No character image (bjorn_character or bjorn1) available")
+
             img_byte_arr = io.BytesIO()
-            self.shared_data.bjorn_character.save(img_byte_arr, format='PNG')
+            img.save(img_byte_arr, format='PNG')
             img_byte_arr = img_byte_arr.getvalue()
+            
             handler.send_response(200)
             handler.send_header('Content-Type', 'image/png')
             handler.send_header('Cache-Control', 'no-cache')
@@ -221,11 +311,16 @@ class ActionUtils:
             handler.send_header("Content-Type", "application/json")
             handler.end_headers()
             handler.wfile.write(json.dumps(bjorn_says_data).encode('utf-8'))
+        except BrokenPipeError:
+            pass
         except Exception as e:
-            handler.send_response(500)
-            handler.send_header("Content-Type", "application/json")
-            handler.end_headers()
-            handler.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+            try:
+                handler.send_response(500)
+                handler.send_header("Content-Type", "application/json")
+                handler.end_headers()
+                handler.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+            except BrokenPipeError:
+                pass
 
     def create_action(self, handler):
         """
@@ -246,7 +341,7 @@ class ActionUtils:
             content_length = int(handler.headers.get("Content-Length", 0))
             body = handler.rfile.read(content_length)
 
-            form = cgi.FieldStorage(
+            form = _MultipartForm(
                 fp=BytesIO(body),
                 headers=handler.headers,
                 environ={"REQUEST_METHOD": "POST"},
@@ -299,12 +394,15 @@ class ActionUtils:
         meta.setdefault("b_module", module_name)
         self.shared_data.db.upsert_simple_action(**meta)
 
-    def delete_action(self, handler):
+    def delete_action(self, handler, data=None):
         """Delete action: python script + images + comment section."""
         try:
-            content_length = int(handler.headers.get("Content-Length", 0))
-            body = handler.rfile.read(content_length) if content_length > 0 else b"{}"
-            data = json.loads(body)
+            if data is None:
+                content_length = int(handler.headers.get("Content-Length", 0))
+                body = handler.rfile.read(content_length) if content_length > 0 else b"{}"
+                data = json.loads(body)
+            elif not isinstance(data, dict):
+                raise ValueError("Invalid JSON payload")
 
             action_name = (data.get("action_name") or "").strip()
             if not action_name:
@@ -518,6 +616,8 @@ class ActionUtils:
             handler.send_header("Content-Length", str(len(content)))
             handler.end_headers()
             handler.wfile.write(content)
+        except BrokenPipeError:
+            pass
         except Exception as e:
             self.logger.error(f"serve_status_image: {e}")
             handler.send_error(500, "Internal Server Error")
@@ -545,13 +645,13 @@ class ActionUtils:
     def upload_static_image(self, handler):
         """Upload a static image; store as BMP. Optional manual size via flags."""
         try:
-            ctype, pdict = cgi.parse_header(handler.headers.get("Content-Type"))
+            ctype, pdict = _parse_header(handler.headers.get("Content-Type"))
             if ctype != "multipart/form-data":
                 raise ValueError("Content-Type must be multipart/form-data")
             pdict["boundary"] = bytes(pdict["boundary"], "utf-8")
             pdict["CONTENT-LENGTH"] = int(handler.headers.get("Content-Length"))
 
-            form = cgi.FieldStorage(
+            form = _MultipartForm(
                 fp=BytesIO(handler.rfile.read(pdict["CONTENT-LENGTH"])),
                 headers=handler.headers,
                 environ={"REQUEST_METHOD": "POST"},
@@ -674,10 +774,13 @@ class ActionUtils:
             self._send_error(handler, str(e))
 
 
-    def rename_image(self, handler):
+    def rename_image(self, handler, data=None):
         """Rename a static image, an action image, or an action folder."""
         try:
-            data = json.loads(handler.rfile.read(int(handler.headers["Content-Length"])).decode("utf-8"))
+            if data is None:
+                data = json.loads(handler.rfile.read(int(handler.headers["Content-Length"])).decode("utf-8"))
+            elif not isinstance(data, dict):
+                raise ValueError("Invalid JSON payload")
             entity_type = data.get("type")  # 'action' | 'static' | 'image'
             old_name = data.get("old_name")
             new_name = data.get("new_name")
@@ -731,15 +834,15 @@ class ActionUtils:
             self._send_error(handler, str(e))
 
     def replace_image(self, h):
-        import cgi
+
         try:
-            ctype, pdict = cgi.parse_header(h.headers.get('Content-Type'))
+            ctype, pdict = _parse_header(h.headers.get('Content-Type'))
             if ctype != 'multipart/form-data':
                 raise ValueError('Content-Type must be multipart/form-data')
             pdict['boundary'] = bytes(pdict['boundary'], 'utf-8')
             pdict['CONTENT-LENGTH'] = int(h.headers.get('Content-Length'))
 
-            form = cgi.FieldStorage(
+            form = _MultipartForm(
                 fp=BytesIO(h.rfile.read(pdict['CONTENT-LENGTH'])),
                 headers=h.headers,
                 environ={'REQUEST_METHOD': 'POST'},
@@ -819,13 +922,13 @@ class ActionUtils:
         Creates the action folder if it doesn't exist.
         """
         try:
-            ctype, pdict = cgi.parse_header(handler.headers.get("Content-Type"))
+            ctype, pdict = _parse_header(handler.headers.get("Content-Type"))
             if ctype != "multipart/form-data":
                 raise ValueError("Content-Type must be multipart/form-data")
             pdict["boundary"] = bytes(pdict["boundary"], "utf-8")
             pdict["CONTENT-LENGTH"] = int(handler.headers.get("Content-Length"))
 
-            form = cgi.FieldStorage(
+            form = _MultipartForm(
                 fp=BytesIO(handler.rfile.read(pdict["CONTENT-LENGTH"])),
                 headers=handler.headers,
                 environ={"REQUEST_METHOD": "POST"},
@@ -867,13 +970,13 @@ class ActionUtils:
         Always resized to 78x78 BMP.
         """
         try:
-            ctype, pdict = cgi.parse_header(handler.headers.get("Content-Type"))
+            ctype, pdict = _parse_header(handler.headers.get("Content-Type"))
             if ctype != "multipart/form-data":
                 raise ValueError("Content-Type must be multipart/form-data")
             pdict["boundary"] = bytes(pdict["boundary"], "utf-8")
             pdict["CONTENT-LENGTH"] = int(handler.headers.get("Content-Length"))
 
-            form = cgi.FieldStorage(
+            form = _MultipartForm(
                 fp=BytesIO(handler.rfile.read(pdict["CONTENT-LENGTH"])),
                 headers=handler.headers,
                 environ={"REQUEST_METHOD": "POST"},
@@ -1117,6 +1220,8 @@ class ActionUtils:
             handler.send_header("Content-Type", "image/bmp" if full.lower().endswith(".bmp") else "image/jpeg")
             handler.end_headers()
             handler.wfile.write(data)
+        except BrokenPipeError:
+            pass
         except Exception as e:
             self.logger.error(f"serve_static_image: {e}")
             handler.send_response(404)
@@ -1175,10 +1280,13 @@ class ActionUtils:
             handler.send_response(404)
             handler.end_headers()
 
-    def create_character(self, handler):
+    def create_character(self, handler, data=None):
         """Create a new character by copying current character's images."""
         try:
-            data = json.loads(handler.rfile.read(int(handler.headers["Content-Length"])).decode("utf-8"))
+            if data is None:
+                data = json.loads(handler.rfile.read(int(handler.headers["Content-Length"])).decode("utf-8"))
+            elif not isinstance(data, dict):
+                raise ValueError("Invalid JSON payload")
             name = (data.get("character_name") or "").strip()
             if not name:
                 raise ValueError("character_name is required")
@@ -1193,10 +1301,13 @@ class ActionUtils:
             self.logger.error(f"create_character: {e}")
             self._send_error(handler, str(e))
 
-    def switch_character(self, handler):
+    def switch_character(self, handler, data=None):
         """Switch character: persist current images, load selected images as active."""
         try:
-            data = json.loads(handler.rfile.read(int(handler.headers["Content-Length"])).decode("utf-8"))
+            if data is None:
+                data = json.loads(handler.rfile.read(int(handler.headers["Content-Length"])).decode("utf-8"))
+            elif not isinstance(data, dict):
+                raise ValueError("Invalid JSON payload")
             target = (data.get("character_name") or "").strip()
             if not target:
                 raise ValueError("character_name is required")
@@ -1230,10 +1341,13 @@ class ActionUtils:
             self.logger.error(f"switch_character: {e}")
             self._send_error(handler, str(e))
 
-    def delete_character(self, handler):
+    def delete_character(self, handler, data=None):
         """Delete a character; if it's the current one, switch back to BJORN first."""
         try:
-            data = json.loads(handler.rfile.read(int(handler.headers["Content-Length"])).decode("utf-8"))
+            if data is None:
+                data = json.loads(handler.rfile.read(int(handler.headers["Content-Length"])).decode("utf-8"))
+            elif not isinstance(data, dict):
+                raise ValueError("Invalid JSON payload")
             name = (data.get("character_name") or "").strip()
             if not name:
                 raise ValueError("character_name is required")
@@ -1519,12 +1633,15 @@ class ActionUtils:
             self._send_error_response(handler, str(e))
 
 
-    def set_action_enabled(self, handler):
+    def set_action_enabled(self, handler, data=None):
         """Body: { action_name: str, enabled: 0|1 }"""
         try:
-            length = int(handler.headers.get('Content-Length', 0))
-            body = handler.rfile.read(length) if length else b'{}'
-            data = json.loads(body or b'{}')
+            if data is None:
+                length = int(handler.headers.get('Content-Length', 0))
+                body = handler.rfile.read(length) if length else b'{}'
+                data = json.loads(body or b'{}')
+            elif not isinstance(data, dict):
+                raise ValueError("Invalid JSON payload")
 
             action_name = (data.get('action_name') or '').strip()
             enabled = 1 if int(data.get('enabled', 0)) else 0
@@ -1538,6 +1655,15 @@ class ActionUtils:
             )
             if not rowcount:
                 raise ValueError(f"Action '{action_name}' not found (b_class)")
+
+            # Best-effort sync to actions_studio when present.
+            try:
+                self.shared_data.db.execute(
+                    "UPDATE actions_studio SET b_enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE b_class = ?;",
+                    (enabled, action_name)
+                )
+            except Exception as e:
+                self.logger.debug(f"set_action_enabled studio sync skipped for {action_name}: {e}")
 
             out = {"status": "success", "action_name": action_name, "enabled": enabled}
             handler.send_response(200)
@@ -1579,7 +1705,7 @@ class ActionUtils:
             if 'multipart/form-data' not in ctype:
                 raise ValueError("Content-Type must be multipart/form-data.")
 
-            form = cgi.FieldStorage(fp=handler.rfile, headers=handler.headers, environ={'REQUEST_METHOD': 'POST'})
+            form = _MultipartForm(fp=handler.rfile, headers=handler.headers, environ={'REQUEST_METHOD': 'POST'})
             if 'attack_file' not in form:
                 raise ValueError("No attack_file field in form.")
 
@@ -1614,11 +1740,14 @@ class ActionUtils:
             self.logger.error(f"Error importing attack: {e}")
             self._send_error_response(handler, str(e))
 
-    def remove_attack(self, handler):
+    def remove_attack(self, handler, data=None):
         """Remove an attack (file + DB row)."""
         try:
-            body = handler.rfile.read(int(handler.headers.get('Content-Length', 0)) or 0)
-            data = json.loads(body or "{}")
+            if data is None:
+                body = handler.rfile.read(int(handler.headers.get('Content-Length', 0)) or 0)
+                data = json.loads(body or "{}")
+            elif not isinstance(data, dict):
+                raise ValueError("Invalid JSON payload")
             attack_name = (data.get("name") or "").strip()
             if not attack_name:
                 raise ValueError("Attack name not provided.")
@@ -1638,11 +1767,14 @@ class ActionUtils:
             self.logger.error(f"Error removing attack: {e}")
             self._send_error_response(handler, str(e))
 
-    def save_attack(self, handler):
+    def save_attack(self, handler, data=None):
         """Save/update attack source code and refresh DB metadata if b_class changed."""
         try:
-            body = handler.rfile.read(int(handler.headers.get('Content-Length', 0)) or 0)
-            data = json.loads(body or "{}")
+            if data is None:
+                body = handler.rfile.read(int(handler.headers.get('Content-Length', 0)) or 0)
+                data = json.loads(body or "{}")
+            elif not isinstance(data, dict):
+                raise ValueError("Invalid JSON payload")
             attack_name = (data.get('name') or '').strip()
             content = data.get('content') or ""
             if not attack_name or not content:
@@ -1675,11 +1807,14 @@ class ActionUtils:
             self.logger.error(f"Error saving attack: {e}")
             self._send_error_response(handler, str(e))
 
-    def restore_attack(self, handler):
+    def restore_attack(self, handler, data=None):
         """Restore an attack from default_actions_dir and re-upsert metadata."""
         try:
-            body = handler.rfile.read(int(handler.headers.get('Content-Length', 0)) or 0)
-            data = json.loads(body or "{}")
+            if data is None:
+                body = handler.rfile.read(int(handler.headers.get('Content-Length', 0)) or 0)
+                data = json.loads(body or "{}")
+            elif not isinstance(data, dict):
+                raise ValueError("Invalid JSON payload")
             attack_name = (data.get('name') or '').strip()
             if not attack_name:
                 raise ValueError("Attack name not provided.")
@@ -1777,12 +1912,12 @@ class ActionUtils:
         except Exception as e: self.logger.error(e); self._err(h, str(e))
 
     def upload_web_image(self, h):
-        import cgi
+
         try:
-            ctype, pdict = cgi.parse_header(h.headers.get('Content-Type'))
+            ctype, pdict = _parse_header(h.headers.get('Content-Type'))
             if ctype != 'multipart/form-data': raise ValueError('Content-Type doit être multipart/form-data')
             pdict['boundary']=bytes(pdict['boundary'],'utf-8'); pdict['CONTENT-LENGTH']=int(h.headers.get('Content-Length'))
-            form = cgi.FieldStorage(fp=BytesIO(h.rfile.read(pdict['CONTENT-LENGTH'])),
+            form = _MultipartForm(fp=BytesIO(h.rfile.read(pdict['CONTENT-LENGTH'])),
                                     headers=h.headers, environ={'REQUEST_METHOD':'POST'}, keep_blank_values=True)
             if 'web_image' not in form or not getattr(form['web_image'],'filename',''): raise ValueError('Aucun fichier web_image fourni')
             file_item = form['web_image']; filename = self._safe(file_item.filename)
@@ -1823,12 +1958,12 @@ class ActionUtils:
         except Exception as e: self.logger.error(e); self._err(h, str(e))
 
     def upload_actions_icon(self, h):
-        import cgi
+
         try:
-            ctype, pdict = cgi.parse_header(h.headers.get('Content-Type'))
+            ctype, pdict = _parse_header(h.headers.get('Content-Type'))
             if ctype != 'multipart/form-data': raise ValueError('Content-Type doit être multipart/form-data')
             pdict['boundary']=bytes(pdict['boundary'],'utf-8'); pdict['CONTENT-LENGTH']=int(h.headers.get('Content-Length'))
-            form = cgi.FieldStorage(fp=BytesIO(h.rfile.read(pdict['CONTENT-LENGTH'])),
+            form = _MultipartForm(fp=BytesIO(h.rfile.read(pdict['CONTENT-LENGTH'])),
                                     headers=h.headers, environ={'REQUEST_METHOD':'POST'}, keep_blank_values=True)
             if 'icon_image' not in form or not getattr(form['icon_image'],'filename',''): raise ValueError('Aucun fichier icon_image fourni')
             file_item = form['icon_image']; filename = self._safe(file_item.filename)
@@ -1846,7 +1981,7 @@ class ActionUtils:
                     if fmt in ('JPEG','BMP'): im = im.convert('RGB')
                     im.save(out, fmt)
                     data = out.getvalue()
-            with open(os.path.join(self.web_images_dir, filename), 'wb') as f:
+            with open(os.path.join(self.actions_icons_dir, filename), 'wb') as f:
                 f.write(data)
             self._send_json(h, {'status':'success','message':'Action icon uploaded','file':filename})
         except Exception as e:

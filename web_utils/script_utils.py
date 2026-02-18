@@ -12,8 +12,85 @@ import threading
 import importlib.util
 import ast
 import html
-import cgi
 from pathlib import Path
+
+
+# --- Multipart form helpers (replaces cgi module removed in Python 3.13) ---
+def _parse_header(line):
+    parts = line.split(';')
+    key = parts[0].strip()
+    pdict = {}
+    for p in parts[1:]:
+        if '=' in p:
+            k, v = p.strip().split('=', 1)
+            pdict[k.strip()] = v.strip().strip('"')
+    return key, pdict
+
+
+class _FormField:
+    __slots__ = ('name', 'filename', 'file', 'value')
+    def __init__(self, name, filename=None, data=b''):
+        self.name = name
+        self.filename = filename
+        if filename:
+            self.file = BytesIO(data)
+            self.value = data
+        else:
+            self.value = data.decode('utf-8', errors='replace').strip()
+            self.file = None
+
+
+class _MultipartForm:
+    """Minimal replacement for _MultipartForm."""
+    def __init__(self, fp, headers, environ=None, keep_blank_values=False):
+        import re as _re
+        self._fields = {}
+        ct = headers.get('Content-Type', '') if hasattr(headers, 'get') else ''
+        _, params = _parse_header(ct)
+        boundary = params.get('boundary', '').encode()
+        if hasattr(fp, 'read'):
+            cl = headers.get('Content-Length') if hasattr(headers, 'get') else None
+            body = fp.read(int(cl)) if cl else fp.read()
+        else:
+            body = fp
+        for part in body.split(b'--' + boundary)[1:]:
+            part = part.strip(b'\r\n')
+            if part == b'--' or not part:
+                continue
+            sep = b'\r\n\r\n' if b'\r\n\r\n' in part else b'\n\n'
+            if sep not in part:
+                continue
+            hdr, data = part.split(sep, 1)
+            hdr_s = hdr.decode('utf-8', errors='replace')
+            nm = _re.search(r'name="([^"]*)"', hdr_s)
+            fn = _re.search(r'filename="([^"]*)"', hdr_s)
+            if not nm:
+                continue
+            name = nm.group(1)
+            filename = fn.group(1) if fn else None
+            field = _FormField(name, filename, data)
+            if name in self._fields:
+                existing = self._fields[name]
+                if isinstance(existing, list):
+                    existing.append(field)
+                else:
+                    self._fields[name] = [existing, field]
+            else:
+                self._fields[name] = field
+
+    def __contains__(self, key):
+        return key in self._fields
+
+    def __getitem__(self, key):
+        return self._fields[key]
+
+    def getvalue(self, key, default=None):
+        if key not in self._fields:
+            return default
+        f = self._fields[key]
+        if isinstance(f, list):
+            return [x.value for x in f]
+        return f.value
 from typing import Any, Dict, Optional, List
 from io import BytesIO
 import logging
@@ -439,7 +516,7 @@ class ScriptUtils:
     def upload_script(self, handler) -> None:
         """Upload a new script file."""
         try:
-            form = cgi.FieldStorage(
+            form = _MultipartForm(
                 fp=handler.rfile,
                 headers=handler.headers,
                 environ={'REQUEST_METHOD': 'POST'}
@@ -519,7 +596,7 @@ class ScriptUtils:
     def upload_project(self, handler) -> None:
         """Upload a project with multiple files."""
         try:
-            form = cgi.FieldStorage(
+            form = _MultipartForm(
                 fp=handler.rfile,
                 headers=handler.headers,
                 environ={'REQUEST_METHOD': 'POST'}

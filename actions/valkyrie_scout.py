@@ -1,313 +1,396 @@
-# Web application scanner for discovering hidden paths and vulnerabilities.
-# Saves settings in `/home/bjorn/.settings_bjorn/valkyrie_scout_settings.json`.
-# Automatically loads saved settings if arguments are not provided.
-# -u, --url         Target URL to scan (overrides saved value).
-# -w, --wordlist    Path to directory wordlist (default: built-in list).
-# -o, --output      Output directory (default: /home/bjorn/Bjorn/data/output/webscan).
-# -t, --threads     Number of concurrent threads (default: 10).
-# -d, --delay       Delay between requests in seconds (default: 0.1).
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+valkyrie_scout.py — Web surface scout (Pi Zero friendly, orchestrator compatible).
 
-import os
+What it does:
+- Probes a small set of common web paths on a target (ip, port).
+- Extracts high-signal indicators from responses (auth type, login form hints, missing security headers,
+  error/debug strings). No exploitation, no bruteforce.
+- Writes results into DB table `webenum` (tool='valkyrie_scout') so the UI can browse findings.
+- Updates EPD fields: bjorn_orch_status, bjorn_status_text2, comment_params, bjorn_progress.
+"""
+
 import json
-import requests
-import argparse
-from datetime import datetime
 import logging
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urljoin
 import re
-from bs4 import BeautifulSoup
+import ssl
+import time
+from http.client import HTTPConnection, HTTPSConnection, RemoteDisconnected
+from typing import Dict, List, Optional, Tuple
+
+from logger import Logger
+from actions.bruteforce_common import ProgressTracker
+
+logger = Logger(name="valkyrie_scout.py", level=logging.DEBUG)
+
+# -------------------- Action metadata (AST-friendly) --------------------
+b_class = "ValkyrieScout"
+b_module = "valkyrie_scout"
+b_status = "ValkyrieScout"
+b_port = 80
+b_parent = None
+b_service = '["http","https"]'
+b_trigger = "on_web_service"
+b_priority = 50
+b_action = "normal"
+b_cooldown = 1800
+b_rate_limit = "8/86400"
+b_enabled = 0  # keep disabled by default; enable via Actions UI/DB when ready.
+
+# Small default list to keep the action cheap on Pi Zero.
+DEFAULT_PATHS = [
+    "/",
+    "/robots.txt",
+    "/login",
+    "/signin",
+    "/auth",
+    "/admin",
+    "/administrator",
+    "/wp-login.php",
+    "/user/login",
+]
+
+# Keep patterns minimal and high-signal.
+SQLI_ERRORS = [
+    "error in your sql syntax",
+    "mysql_fetch",
+    "unclosed quotation mark",
+    "ora-",
+    "postgresql",
+    "sqlite error",
+]
+LFI_HINTS = [
+    "include(",
+    "require(",
+    "include_once(",
+    "require_once(",
+]
+DEBUG_HINTS = [
+    "stack trace",
+    "traceback",
+    "exception",
+    "fatal error",
+    "notice:",
+    "warning:",
+    "debug",
+]
 
 
-b_class       = "ValkyrieScout"
-b_module      = "valkyrie_scout"
-b_enabled    = 0
+def _scheme_for_port(port: int) -> str:
+    https_ports = {443, 8443, 9443, 10443, 9444, 5000, 5001, 7080, 9080}
+    return "https" if int(port) in https_ports else "http"
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Default settings
-DEFAULT_OUTPUT_DIR = "/home/bjorn/Bjorn/data/output/webscan"
-DEFAULT_SETTINGS_DIR = "/home/bjorn/.settings_bjorn"
-SETTINGS_FILE = os.path.join(DEFAULT_SETTINGS_DIR, "valkyrie_scout_settings.json")
-
-# Common web vulnerabilities to check
-VULNERABILITY_PATTERNS = {
-    'sql_injection': [
-        "error in your SQL syntax",
-        "mysql_fetch_array",
-        "ORA-",
-        "PostgreSQL",
-    ],
-    'xss': [
-        "<script>alert(1)</script>",
-        "javascript:alert(1)",
-    ],
-    'lfi': [
-        "include(",
-        "require(",
-        "include_once(",
-        "require_once(",
-    ]
-}
-
-class ValkyieScout:
-    def __init__(self, url, wordlist=None, output_dir=DEFAULT_OUTPUT_DIR, threads=10, delay=0.1):
-        self.base_url = url.rstrip('/')
-        self.wordlist = wordlist
-        self.output_dir = output_dir
-        self.threads = threads
-        self.delay = delay
-        
-        self.discovered_paths = set()
-        self.vulnerabilities = []
-        self.forms = []
-        
-        self.session = requests.Session()
-        self.session.headers = {
-            'User-Agent': 'Valkyrie Scout Web Scanner',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        }
-        
-        self.lock = threading.Lock()
-
-    def load_wordlist(self):
-        """Load directory wordlist."""
-        if self.wordlist and os.path.exists(self.wordlist):
-            with open(self.wordlist, 'r') as f:
-                return [line.strip() for line in f if line.strip()]
-        return [
-            'admin', 'wp-admin', 'administrator', 'login', 'wp-login.php',
-            'upload', 'uploads', 'backup', 'backups', 'config', 'configuration',
-            'dev', 'development', 'test', 'testing', 'staging', 'prod',
-            'api', 'v1', 'v2', 'beta', 'debug', 'console', 'phpmyadmin',
-            'mysql', 'database', 'db', 'wp-content', 'includes', 'tmp', 'temp'
-        ]
-
-    def scan_path(self, path):
-        """Scan a single path for existence and vulnerabilities."""
-        url = urljoin(self.base_url, path)
-        try:
-            response = self.session.get(url, allow_redirects=False)
-            
-            if response.status_code in [200, 301, 302, 403]:
-                with self.lock:
-                    self.discovered_paths.add({
-                        'path': path,
-                        'url': url,
-                        'status_code': response.status_code,
-                        'content_length': len(response.content),
-                        'timestamp': datetime.now().isoformat()
-                    })
-                
-                # Scan for vulnerabilities
-                self.check_vulnerabilities(url, response)
-                
-                # Extract and analyze forms
-                self.analyze_forms(url, response)
-                
-        except Exception as e:
-            logging.error(f"Error scanning {url}: {e}")
-
-    def check_vulnerabilities(self, url, response):
-        """Check for common vulnerabilities in the response."""
-        try:
-            content = response.text.lower()
-            
-            for vuln_type, patterns in VULNERABILITY_PATTERNS.items():
-                for pattern in patterns:
-                    if pattern.lower() in content:
-                        with self.lock:
-                            self.vulnerabilities.append({
-                                'type': vuln_type,
-                                'url': url,
-                                'pattern': pattern,
-                                'timestamp': datetime.now().isoformat()
-                            })
-                            
-            # Additional checks
-            self.check_security_headers(url, response)
-            self.check_information_disclosure(url, response)
-            
-        except Exception as e:
-            logging.error(f"Error checking vulnerabilities for {url}: {e}")
-
-    def analyze_forms(self, url, response):
-        """Analyze HTML forms for potential vulnerabilities."""
-        try:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            forms = soup.find_all('form')
-            
-            for form in forms:
-                form_data = {
-                    'url': url,
-                    'method': form.get('method', 'get').lower(),
-                    'action': urljoin(url, form.get('action', '')),
-                    'inputs': [],
-                    'timestamp': datetime.now().isoformat()
-                }
-                
-                # Analyze form inputs
-                for input_field in form.find_all(['input', 'textarea']):
-                    input_data = {
-                        'type': input_field.get('type', 'text'),
-                        'name': input_field.get('name', ''),
-                        'id': input_field.get('id', ''),
-                        'required': input_field.get('required') is not None
-                    }
-                    form_data['inputs'].append(input_data)
-                
-                with self.lock:
-                    self.forms.append(form_data)
-                    
-        except Exception as e:
-            logging.error(f"Error analyzing forms in {url}: {e}")
-
-    def check_security_headers(self, url, response):
-        """Check for missing or misconfigured security headers."""
-        security_headers = {
-            'X-Frame-Options': 'Missing X-Frame-Options header',
-            'X-XSS-Protection': 'Missing X-XSS-Protection header',
-            'X-Content-Type-Options': 'Missing X-Content-Type-Options header',
-            'Strict-Transport-Security': 'Missing HSTS header',
-            'Content-Security-Policy': 'Missing Content-Security-Policy'
-        }
-        
-        for header, message in security_headers.items():
-            if header not in response.headers:
-                with self.lock:
-                    self.vulnerabilities.append({
-                        'type': 'missing_security_header',
-                        'url': url,
-                        'detail': message,
-                        'timestamp': datetime.now().isoformat()
-                    })
-
-    def check_information_disclosure(self, url, response):
-        """Check for information disclosure in response."""
-        patterns = {
-            'email': r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',
-            'internal_ip': r'\b(?:192\.168|10\.|172\.(?:1[6-9]|2[0-9]|3[01]))\.\d{1,3}\.\d{1,3}\b',
-            'debug_info': r'(?:stack trace|debug|error|exception)',
-            'version_info': r'(?:version|powered by|built with)'
-        }
-        
-        content = response.text.lower()
-        for info_type, pattern in patterns.items():
-            matches = re.findall(pattern, content, re.IGNORECASE)
-            if matches:
-                with self.lock:
-                    self.vulnerabilities.append({
-                        'type': 'information_disclosure',
-                        'url': url,
-                        'info_type': info_type,
-                        'findings': matches,
-                        'timestamp': datetime.now().isoformat()
-                    })
-
-    def save_results(self):
-        """Save scan results to JSON files."""
-        try:
-            os.makedirs(self.output_dir, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            
-            # Save discovered paths
-            if self.discovered_paths:
-                paths_file = os.path.join(self.output_dir, f"paths_{timestamp}.json")
-                with open(paths_file, 'w') as f:
-                    json.dump(list(self.discovered_paths), f, indent=4)
-            
-            # Save vulnerabilities
-            if self.vulnerabilities:
-                vulns_file = os.path.join(self.output_dir, f"vulnerabilities_{timestamp}.json")
-                with open(vulns_file, 'w') as f:
-                    json.dump(self.vulnerabilities, f, indent=4)
-            
-            # Save form analysis
-            if self.forms:
-                forms_file = os.path.join(self.output_dir, f"forms_{timestamp}.json")
-                with open(forms_file, 'w') as f:
-                    json.dump(self.forms, f, indent=4)
-            
-            logging.info(f"Results saved to {self.output_dir}")
-            
-        except Exception as e:
-            logging.error(f"Failed to save results: {e}")
-
-    def execute(self):
-        """Execute the web application scan."""
-        try:
-            logging.info(f"Starting web scan on {self.base_url}")
-            paths = self.load_wordlist()
-            
-            with ThreadPoolExecutor(max_workers=self.threads) as executor:
-                executor.map(self.scan_path, paths)
-            
-            self.save_results()
-            
-        except Exception as e:
-            logging.error(f"Scan error: {e}")
-        finally:
-            self.session.close()
-
-def save_settings(url, wordlist, output_dir, threads, delay):
-    """Save settings to JSON file."""
+def _first_hostname_from_row(row: Dict) -> str:
     try:
-        os.makedirs(DEFAULT_SETTINGS_DIR, exist_ok=True)
-        settings = {
-            "url": url,
-            "wordlist": wordlist,
-            "output_dir": output_dir,
-            "threads": threads,
-            "delay": delay
-        }
-        with open(SETTINGS_FILE, 'w') as f:
-            json.dump(settings, f)
-        logging.info(f"Settings saved to {SETTINGS_FILE}")
-    except Exception as e:
-        logging.error(f"Failed to save settings: {e}")
+        hn = (row.get("Hostname") or row.get("hostname") or row.get("hostnames") or "").strip()
+        if ";" in hn:
+            hn = hn.split(";", 1)[0].strip()
+        return hn
+    except Exception:
+        return ""
 
-def load_settings():
-    """Load settings from JSON file."""
-    if os.path.exists(SETTINGS_FILE):
+
+def _lower_headers(headers: Dict[str, str]) -> Dict[str, str]:
+    out = {}
+    for k, v in (headers or {}).items():
+        if not k:
+            continue
+        out[str(k).lower()] = str(v)
+    return out
+
+
+def _detect_signals(status: int, headers: Dict[str, str], body_snippet: str) -> Dict[str, object]:
+    h = _lower_headers(headers)
+    www = h.get("www-authenticate", "")
+    set_cookie = h.get("set-cookie", "")
+
+    auth_type = None
+    if status == 401 and "basic" in www.lower():
+        auth_type = "basic"
+    elif status == 401 and "digest" in www.lower():
+        auth_type = "digest"
+
+    snippet = (body_snippet or "").lower()
+    has_form = "<form" in snippet
+    has_password = "type=\"password\"" in snippet or "type='password'" in snippet
+    looks_like_login = bool(has_form and has_password) or any(x in snippet for x in ["login", "sign in", "connexion"])
+
+    csrf_markers = [
+        "csrfmiddlewaretoken",
+        "authenticity_token",
+        "csrf_token",
+        "name=\"_token\"",
+        "name='_token'",
+    ]
+    has_csrf = any(m in snippet for m in csrf_markers)
+
+    missing_headers = []
+    for header in [
+        "x-frame-options",
+        "x-content-type-options",
+        "content-security-policy",
+        "referrer-policy",
+    ]:
+        if header not in h:
+            missing_headers.append(header)
+    # HSTS is only relevant on HTTPS.
+    if "strict-transport-security" not in h:
+        missing_headers.append("strict-transport-security")
+
+    rate_limited_hint = (status == 429) or ("retry-after" in h) or ("x-ratelimit-remaining" in h)
+
+    # Very cheap "issue hints"
+    issues = []
+    for s in SQLI_ERRORS:
+        if s in snippet:
+            issues.append("sqli_error_hint")
+            break
+    for s in LFI_HINTS:
+        if s in snippet:
+            issues.append("lfi_hint")
+            break
+    for s in DEBUG_HINTS:
+        if s in snippet:
+            issues.append("debug_hint")
+            break
+
+    cookie_names = []
+    if set_cookie:
+        for part in set_cookie.split(","):
+            name = part.split(";", 1)[0].split("=", 1)[0].strip()
+            if name and name not in cookie_names:
+                cookie_names.append(name)
+
+    return {
+        "auth_type": auth_type,
+        "looks_like_login": bool(looks_like_login),
+        "has_csrf": bool(has_csrf),
+        "missing_security_headers": missing_headers[:12],
+        "rate_limited_hint": bool(rate_limited_hint),
+        "issues": issues[:8],
+        "cookie_names": cookie_names[:12],
+        "server": h.get("server", ""),
+        "x_powered_by": h.get("x-powered-by", ""),
+    }
+
+
+class ValkyrieScout:
+    def __init__(self, shared_data):
+        self.shared_data = shared_data
+        self._ssl_ctx = ssl._create_unverified_context()
+
+    def _fetch(
+        self,
+        *,
+        ip: str,
+        port: int,
+        scheme: str,
+        path: str,
+        timeout_s: float,
+        user_agent: str,
+        max_bytes: int,
+    ) -> Tuple[int, Dict[str, str], str, int, int]:
+        started = time.time()
+        headers_out: Dict[str, str] = {}
+        status = 0
+        size = 0
+        body_snip = ""
+
+        conn = None
         try:
-            with open(SETTINGS_FILE, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logging.error(f"Failed to load settings: {e}")
-    return {}
+            if scheme == "https":
+                conn = HTTPSConnection(ip, port=port, timeout=timeout_s, context=self._ssl_ctx)
+            else:
+                conn = HTTPConnection(ip, port=port, timeout=timeout_s)
 
-def main():
-    parser = argparse.ArgumentParser(description="Web application vulnerability scanner")
-    parser.add_argument("-u", "--url", help="Target URL to scan")
-    parser.add_argument("-w", "--wordlist", help="Path to directory wordlist")
-    parser.add_argument("-o", "--output", default=DEFAULT_OUTPUT_DIR, help="Output directory")
-    parser.add_argument("-t", "--threads", type=int, default=10, help="Number of threads")
-    parser.add_argument("-d", "--delay", type=float, default=0.1, help="Delay between requests")
+            conn.request("GET", path, headers={"User-Agent": user_agent, "Accept": "*/*"})
+            resp = conn.getresponse()
+            status = int(resp.status or 0)
+            for k, v in resp.getheaders():
+                if k and v:
+                    headers_out[str(k)] = str(v)
+
+            chunk = resp.read(max_bytes)
+            size = len(chunk or b"")
+            try:
+                body_snip = (chunk or b"").decode("utf-8", errors="ignore")
+            except Exception:
+                body_snip = ""
+        except (ConnectionError, TimeoutError, RemoteDisconnected):
+            status = 0
+        except Exception:
+            status = 0
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+        elapsed_ms = int((time.time() - started) * 1000)
+        return status, headers_out, body_snip, size, elapsed_ms
+
+    def _db_upsert(
+        self,
+        *,
+        mac: str,
+        ip: str,
+        hostname: str,
+        port: int,
+        path: str,
+        status: int,
+        size: int,
+        response_ms: int,
+        content_type: str,
+        payload: dict,
+        user_agent: str,
+    ):
+        try:
+            headers_json = json.dumps(payload, ensure_ascii=True)
+        except Exception:
+            headers_json = ""
+
+        self.shared_data.db.execute(
+            """
+            INSERT INTO webenum (
+                mac_address, ip, hostname, port, directory, status,
+                size, response_time, content_type, tool, method,
+                user_agent, headers, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'valkyrie_scout', 'GET', ?, ?, 1)
+            ON CONFLICT(mac_address, ip, port, directory) DO UPDATE SET
+                status = excluded.status,
+                size = excluded.size,
+                response_time = excluded.response_time,
+                content_type = excluded.content_type,
+                hostname = COALESCE(excluded.hostname, webenum.hostname),
+                user_agent = COALESCE(excluded.user_agent, webenum.user_agent),
+                headers = COALESCE(excluded.headers, webenum.headers),
+                last_seen = CURRENT_TIMESTAMP,
+                is_active = 1
+            """,
+            (
+                mac or "",
+                ip or "",
+                hostname or "",
+                int(port),
+                path or "/",
+                int(status),
+                int(size or 0),
+                int(response_ms or 0),
+                content_type or "",
+                user_agent or "",
+                headers_json,
+            ),
+        )
+
+    def execute(self, ip, port, row, status_key) -> str:
+        if self.shared_data.orchestrator_should_exit:
+            return "interrupted"
+
+        try:
+            port_i = int(port) if str(port).strip() else int(getattr(self, "port", 80) or 80)
+        except Exception:
+            port_i = 80
+
+        scheme = _scheme_for_port(port_i)
+        hostname = _first_hostname_from_row(row)
+        mac = (row.get("MAC Address") or row.get("mac_address") or row.get("mac") or "").strip()
+
+        timeout_s = float(getattr(self.shared_data, "web_probe_timeout_s", 4.0))
+        user_agent = str(getattr(self.shared_data, "web_probe_user_agent", "BjornWebScout/1.0"))
+        max_bytes = int(getattr(self.shared_data, "web_probe_max_bytes", 65536))
+        delay_s = float(getattr(self.shared_data, "valkyrie_delay_s", 0.05))
+
+        paths = getattr(self.shared_data, "valkyrie_scout_paths", None)
+        if not isinstance(paths, list) or not paths:
+            paths = DEFAULT_PATHS
+
+        # UI
+        self.shared_data.bjorn_orch_status = "ValkyrieScout"
+        self.shared_data.bjorn_status_text2 = f"{ip}:{port_i}"
+        self.shared_data.comment_params = {"ip": ip, "port": str(port_i)}
+
+        progress = ProgressTracker(self.shared_data, len(paths))
+
+        try:
+            for p in paths:
+                if self.shared_data.orchestrator_should_exit:
+                    return "interrupted"
+
+                path = str(p or "/").strip()
+                if not path.startswith("/"):
+                    path = "/" + path
+
+                status, headers, body, size, elapsed_ms = self._fetch(
+                    ip=ip,
+                    port=port_i,
+                    scheme=scheme,
+                    path=path,
+                    timeout_s=timeout_s,
+                    user_agent=user_agent,
+                    max_bytes=max_bytes,
+                )
+
+                # Only keep minimal info; do not store full HTML.
+                ctype = headers.get("Content-Type") or headers.get("content-type") or ""
+                signals = _detect_signals(status, headers, body)
+
+                payload = {
+                    "signals": signals,
+                    "sample": {"status": int(status), "content_type": ctype, "rt_ms": int(elapsed_ms)},
+                }
+
+                try:
+                    self._db_upsert(
+                        mac=mac,
+                        ip=ip,
+                        hostname=hostname,
+                        port=port_i,
+                        path=path,
+                        status=status or 0,
+                        size=size,
+                        response_ms=elapsed_ms,
+                        content_type=ctype,
+                        payload=payload,
+                        user_agent=user_agent,
+                    )
+                except Exception as e:
+                    logger.error(f"DB write failed for {ip}:{port_i}{path}: {e}")
+
+                self.shared_data.comment_params = {
+                    "ip": ip,
+                    "port": str(port_i),
+                    "path": path,
+                    "status": str(status),
+                    "login": str(int(bool(signals.get("looks_like_login") or signals.get("auth_type")))),
+                }
+                progress.advance(1)
+
+                if delay_s > 0:
+                    time.sleep(delay_s)
+
+            progress.set_complete()
+            return "success"
+        finally:
+            self.shared_data.bjorn_progress = ""
+            self.shared_data.comment_params = {}
+            self.shared_data.bjorn_status_text2 = ""
+
+
+# -------------------- Optional CLI (debug/manual) --------------------
+if __name__ == "__main__":
+    import argparse
+    from shared import SharedData
+
+    parser = argparse.ArgumentParser(description="ValkyrieScout (light web scout)")
+    parser.add_argument("--ip", required=True)
+    parser.add_argument("--port", default="80")
     args = parser.parse_args()
 
-    settings = load_settings()
-    url = args.url or settings.get("url")
-    wordlist = args.wordlist or settings.get("wordlist")
-    output_dir = args.output or settings.get("output_dir")
-    threads = args.threads or settings.get("threads")
-    delay = args.delay or settings.get("delay")
+    sd = SharedData()
+    act = ValkyrieScout(sd)
+    row = {"MAC Address": sd.get_raspberry_mac() or "__GLOBAL__", "Hostname": ""}
+    print(act.execute(args.ip, args.port, row, "ValkyrieScout"))
 
-    if not url:
-        logging.error("URL is required. Use -u or save it in settings")
-        return
-
-    save_settings(url, wordlist, output_dir, threads, delay)
-
-    scanner = ValkyieScout(
-        url=url,
-        wordlist=wordlist,
-        output_dir=output_dir,
-        threads=threads,
-        delay=delay
-    )
-    scanner.execute()
-
-if __name__ == "__main__":
-    main()

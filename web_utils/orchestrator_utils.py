@@ -42,7 +42,7 @@ class OrchestratorUtils:
                 raise Exception(f"No data found for IP: {ip}")
 
             action_key = action_instance.action_name
-            self.logger.info(f"Executing {action_key} on {ip}:{port}")
+            self.logger.info(f"Executing [MANUAL]: {action_key} on {ip}:{port}")
             result = action_instance.execute(ip, port, row, action_key)
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -97,7 +97,10 @@ class OrchestratorUtils:
         """Start the orchestrator."""
         try:
             bjorn_instance = self.shared_data.bjorn_instance
-            self.shared_data.manual_mode = False
+            if getattr(self.shared_data, "ai_mode", False):
+                self.shared_data.operation_mode = "AI"
+            else:
+                self.shared_data.operation_mode = "AUTO"
             self.shared_data.orchestrator_should_exit = False
             bjorn_instance.start_orchestrator()
             return {"status": "success", "message": "Orchestrator starting..."}
@@ -109,7 +112,7 @@ class OrchestratorUtils:
         """Stop the orchestrator."""
         try:
             bjorn_instance = self.shared_data.bjorn_instance
-            self.shared_data.manual_mode = False
+            self.shared_data.operation_mode = "MANUAL"
             bjorn_instance.stop_orchestrator()
             self.shared_data.orchestrator_should_exit = True
             return {"status": "success", "message": "Orchestrator stopping..."}

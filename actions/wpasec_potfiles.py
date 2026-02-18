@@ -8,6 +8,7 @@ import argparse
 import requests
 import subprocess
 from datetime import datetime
+
 import logging
 
 # ── METADATA / UI FOR NEO LAUNCHER ────────────────────────────────────────────
@@ -172,8 +173,9 @@ class WPAsecPotfileManager:
             response = requests.get(self.DOWNLOAD_URL, cookies=cookies, stream=True)
             response.raise_for_status()
 
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            filename = os.path.join(save_dir, f"potfile_{timestamp}.pot")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            filename = os.path.join(save_dir, f"potfile_{ts}.pot")
 
             os.makedirs(save_dir, exist_ok=True)
             with open(filename, "wb") as file:

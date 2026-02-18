@@ -6,17 +6,23 @@
 # - Pas de décalage wrap-around d’1 pixel (fini la ligne sombre)
 
 import logging
+import time
 from . import epdconfig
+from logger import Logger
 
 # Résolution physique du panneau (hardware)
 EPD_WIDTH  = 122
 EPD_HEIGHT = 250
 
-logger = logging.getLogger(__name__)
+logger = Logger(name="epd2in13_V2.py", level=logging.DEBUG)
 
 class EPD:
     def __init__(self):
         self.is_initialized = False
+        # Defensive timeout/logging for BUSY pin stalls.
+        self.busy_timeout_s = 30.0
+        self.busy_poll_ms = 50
+        self.busy_log_interval_s = 5.0
         self.reset_pin = epdconfig.RST_PIN
         self.dc_pin = epdconfig.DC_PIN
         self.busy_pin = epdconfig.BUSY_PIN
@@ -87,8 +93,22 @@ class EPD:
         
     def ReadBusy(self):
         # 0: idle, 1: busy
+        started = time.monotonic()
+        last_log = started
         while epdconfig.digital_read(self.busy_pin) == 1:
-            epdconfig.delay_ms(50)    
+            now = time.monotonic()
+            waited = now - started
+            if waited >= self.busy_timeout_s:
+                raise TimeoutError(
+                    f"EPD busy timeout after {self.busy_timeout_s:.1f}s "
+                    f"(pin={self.busy_pin}, state=1, expected idle=0)"
+                )
+            if (now - last_log) >= self.busy_log_interval_s:
+                logger.warning(
+                    f"ReadBusy waiting {waited:.1f}s (pin={self.busy_pin}, state=1/busy)"
+                )
+                last_log = now
+            epdconfig.delay_ms(self.busy_poll_ms)
 
     def TurnOnDisplay(self):
         self.send_command(0x22)

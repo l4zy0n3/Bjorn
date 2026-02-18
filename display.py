@@ -1,47 +1,169 @@
-# display.py - FIXED VERSION (v2 + wrap_text/throttle optimizations)
-# - Un seul thread d’update EPD à la fois (pas d’accumulation)
-# - Full refresh déplacé dans le worker
-# - Circuit breaker : désactive temporairement l’EPD après échecs répétés
-# - Timeouts & logs conservés / améliorés
-# - Reste compatible avec le code appelant
-# - NEW: comment layout cache + throttling to reduce wrap_text calls
+﻿# display.py
+# Core component for managing the E-Paper Display (EPD) and Web Interface Screenshot
+# OPTIMIZED FOR PI ZERO 2: Asynchronous Rendering, Text Caching, and I/O Throttling.
+# FULL VERSION - NO LOGIC REMOVED
 
+import math
 import threading
 import time
 import os
 import signal
 import logging
-import random
 import sys
 import traceback
-import json
-import subprocess
 from typing import Dict, List, Optional, Any, Tuple
 from PIL import Image, ImageDraw, ImageFont
 from init_shared import shared_data
-from comment import CommentAI
 from logger import Logger
 
 logger = Logger(name="display.py", level=logging.DEBUG)
 
 
-class Display:
-    """Optimized display manager with robust error handling and recovery"""
+class DisplayUpdateController:
+    """
+    Single-writer EPD update queue. 
+    Ensures only one thread accesses the SPI bus at a time.
+    Drops older frames if the display is busy (Frame Skipping) to prevent lag.
+    """
 
-    # CRITICAL: Timeout constants
-    SEMAPHORE_TIMEOUT = 5.0          # Max time to wait for semaphore
-    EPD_OPERATION_TIMEOUT = 10.0     # Max time for EPD operation (indicative)
-    LOOP_ITERATION_TIMEOUT = 30.0    # Max time for one display loop
+    def __init__(self, update_fn):
+        self.update_fn = update_fn
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._latest_frame: Optional[Image.Image] = None
+        self._metrics = {
+            "queue_dropped": 0,
+            "queue_submitted": 0,
+            "processed": 0,
+            "failures": 0,
+            "last_duration_s": 0.0,
+            "last_error": "",
+            "busy_since": 0.0,
+            "last_update_epoch": 0.0,
+        }
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._worker_loop, 
+            daemon=True, 
+            name="DisplayUpdateController"
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = 2.0):
+        self._stop.set()
+        self._event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+        # Close any residual pending frame
+        residual = self._pop_latest_frame()
+        if residual is not None:
+            try:
+                residual.close()
+            except Exception:
+                pass
+        return not bool(self._thread and self._thread.is_alive())
+
+    def submit(self, frame: Image.Image):
+        """Submit a new frame. If busy, drop the previous pending frame (Latest-Win strategy)."""
+        with self._lock:
+            old_frame = self._latest_frame
+            if old_frame is not None:
+                self._metrics["queue_dropped"] += 1
+            self._latest_frame = frame
+            self._metrics["queue_submitted"] += 1
+        # Close the dropped frame outside the lock to avoid holding it while doing I/O
+        if old_frame is not None:
+            try:
+                old_frame.close()
+            except Exception:
+                pass
+        self._event.set()
+
+    def get_metrics(self) -> Dict[str, Any]:
+        with self._lock:
+            metrics = dict(self._metrics)
+        busy_since = float(metrics.get("busy_since") or 0.0)
+        metrics["busy_for_s"] = (time.monotonic() - busy_since) if busy_since else 0.0
+        metrics["thread_alive"] = bool(self._thread and self._thread.is_alive())
+        return metrics
+
+    def _pop_latest_frame(self) -> Optional[Image.Image]:
+        with self._lock:
+            frame = self._latest_frame
+            self._latest_frame = None
+        return frame
+
+    def _set_busy(self, busy: bool):
+        with self._lock:
+            self._metrics["busy_since"] = time.monotonic() if busy else 0.0
+
+    def _mark_success(self, duration_s: float):
+        with self._lock:
+            self._metrics["processed"] += 1
+            self._metrics["last_duration_s"] = duration_s
+            self._metrics["last_update_epoch"] = time.time()
+            self._metrics["last_error"] = ""
+
+    def _mark_failure(self, duration_s: float, error: str):
+        with self._lock:
+            self._metrics["failures"] += 1
+            self._metrics["last_duration_s"] = duration_s
+            self._metrics["last_error"] = error
+
+    def _worker_loop(self):
+        while not self._stop.is_set():
+            self._event.wait(timeout=0.5)
+            self._event.clear()
+
+            if self._stop.is_set():
+                break
+
+            frame = self._pop_latest_frame()
+            if frame is None:
+                continue
+
+            started = time.monotonic()
+            self._set_busy(True)
+            try:
+                # Execute the actual EPD write
+                ok = bool(self.update_fn(frame))
+                duration = time.monotonic() - started
+                if ok:
+                    self._mark_success(duration)
+                else:
+                    self._mark_failure(duration, "update_fn returned False")
+            except Exception as exc:
+                duration = time.monotonic() - started
+                self._mark_failure(duration, str(exc))
+                logger.error(f"EPD update worker failure: {exc}")
+            finally:
+                self._set_busy(False)
+                try:
+                    frame.close()
+                except Exception:
+                    pass
+
+
+class Display:
+    """
+    Optimized display manager with robust error handling and recovery.
+    Decouples rendering (CPU) from displaying (SPI/IO) to ensure stability on Pi Zero 2.
+    """
+
     RECOVERY_COOLDOWN = 60.0         # Min time between hard resets
 
     # Circuit breaker
-    MAX_CONSECUTIVE_FAILURES = 6     # Après N échecs, on coupe l’EPD
-    STUCK_RECOVERY_S = 120.0         # Si bloqué > 120s, on tente recovery
+    MAX_CONSECUTIVE_FAILURES = 6     # Disable EPD after N failures
 
     def __init__(self, shared_data):
         self.shared_data = shared_data
         self.config = self.shared_data.config
-        self.comment_ai = CommentAI()
         self.epd_enabled = self.config.get("epd_enabled", True)
 
         self.epd = self.shared_data.epd if self.epd_enabled else None
@@ -51,38 +173,34 @@ class Display:
         else:
             self.shared_data.width = self.shared_data.width
 
-        self.semaphore = threading.Semaphore(self.shared_data.semaphore_slots)
-
         # Recovery tracking
         self.last_successful_update = time.time()
         self.last_recovery_attempt = 0
         self.consecutive_failures = 0
         self.total_updates = 0
         self.failed_updates = 0
+        self.retry_attempts = 0
+        self.reinit_attempts = 0
+        self.watchdog_stuck_count = 0
+        self.headless_reason = ""
 
-        # Update worker (évite l’empilement)
-        self._upd_lock = threading.Lock()
-        self._upd_thread: Optional[threading.Thread] = None
-        self._upd_stuck_since: Optional[float] = None
+        # EPD runtime controls
+        self.epd_watchdog_timeout = float(self.config.get("epd_watchdog_timeout", 45))
+        self.RECOVERY_COOLDOWN = float(self.config.get("epd_recovery_cooldown", 60))
+        self.epd_error_backoff = float(self.config.get("epd_error_backoff", 2))
+        self._partial_mode_ready = False
+        self._epd_mode_lock = threading.Lock()
+        self._recovery_lock = threading.Lock()
+        self._recovery_in_progress = False
+        self._watchdog_last_log = 0.0
         self._last_full_refresh = time.time()
+        
+        # Asynchronous Controller
+        self.display_controller = DisplayUpdateController(self._process_epd_frame)
 
         # Screen configuration
         self.screen_reversed = self.shared_data.screen_reversed
         self.web_screen_reversed = self.shared_data.web_screen_reversed
-
-        # Network status with caching
-        self.ssid = ""
-        self.current_ip = ""
-        self.show_ip_on_screen = False
-        self.show_ssid_on_screen = False
-        self._network_cache = {'ip': None, 'ssid': None, 'timestamp': 0}
-        self._network_cache_ttl = 30
-
-        self._connection_cache = {'data': None, 'timestamp': 0}
-        self._connection_cache_ttl = 10
-
-        self._data_count_cache = {'count': 0, 'timestamp': 0}
-        self._data_count_cache_ttl = 60
 
         # Display name
         self.bjorn_name = self.shared_data.bjorn_name
@@ -93,23 +211,22 @@ class Display:
         self.fullrefresh_activated = self.shared_data.fullrefresh_activated
         self.fullrefresh_delay = self.shared_data.fullrefresh_delay
 
-        # Cache for expensive operations
-        self._stats_cache = {'data': None, 'timestamp': 0}
-        self._stats_cache_ttl = 5.0
-
         # NEW: comment wrap/layout cache + throttle
         self._comment_layout_cache = {"key": None, "lines": [], "ts": 0.0}
-        # Recompute at most once per this interval unless the key changes
         self._comment_layout_min_interval = max(0.8, float(self.shared_data.screen_delay))
+        self._last_screenshot_time = 0
+        self._screenshot_interval_s = max(1.0, float(self.config.get("web_screenshot_interval_s", 4.0)))
 
         # Initialize display
         try:
             if self.epd_enabled:
                 self.shared_data.epd.init_full_update()
+                self._partial_mode_ready = False
                 logger.info("EPD display initialization complete")
 
                 if self.shared_data.showstartupipssid:
-                    ip_address, ssid = self.get_network_info()
+                    ip_address = getattr(self.shared_data, "current_ip", "No IP")
+                    ssid = getattr(self.shared_data, "current_ssid", "No Wi-Fi")
                     self.display_startup_ip(ip_address, ssid)
                     time.sleep(self.shared_data.startup_splash_duration)
             else:
@@ -118,27 +235,22 @@ class Display:
         except Exception as e:
             logger.error(f"Error during display initialization: {e}")
             if self.epd_enabled:
-                # On remonte si EPD était censé être actif (cohérent avec l’existant)
+                # If EPD was supposed to be enabled but failed, raise to alert supervisor
                 raise
             else:
                 logger.warning("EPD initialization failed but continuing in web-only mode")
 
         self.shared_data.bjorn_status_text2 = "Awakening..."
+        try:
+            self.shared_data.update_battery_status()
+        except Exception as e:
+            logger.warning_throttled(
+                f"Initial battery probe failed: {e}",
+                key="display_initial_battery_probe",
+                interval_s=120.0,
+            )
 
-        # Start background threads
-        self._start_background_threads()
-
-    def _start_background_threads(self):
-        """Start all background update threads"""
-        self.main_image_thread = threading.Thread(
-            target=self.update_main_image, daemon=True, name="DisplayImageUpdater"
-        )
-        self.main_image_thread.start()
-
-        self.stats_update_thread = threading.Thread(
-            target=self.schedule_stats_update, daemon=True, name="DisplayStatsUpdater"
-        )
-        self.stats_update_thread.start()
+        self.display_controller.start()
 
     # ---- Positioning helpers ----
 
@@ -154,7 +266,8 @@ class Display:
         default_font_size = 13
         default_font_path = self.shared_data.font_viking_path
         default_font = ImageFont.truetype(default_font_path, default_font_size)
-        max_text_width, _ = default_font.getsize("BJORN")
+        bbox = default_font.getbbox("BJORN")
+        max_text_width = bbox[2] - bbox[0]
 
         self.font_to_use = self.get_font_to_fit(
             self.bjorn_name, default_font_path, max_text_width, default_font_size
@@ -163,12 +276,14 @@ class Display:
     def get_font_to_fit(self, text: str, font_path: str, max_width: int, max_font_size: int):
         font_size = max_font_size
         font = ImageFont.truetype(font_path, font_size)
-        text_width, _ = font.getsize(text)
+        bbox = font.getbbox(text)
+        text_width = bbox[2] - bbox[0]
 
         while text_width > max_width and font_size > 5:
             font_size -= 1
             font = ImageFont.truetype(font_path, font_size)
-            text_width, _ = font.getsize(text)
+            bbox = font.getbbox(text)
+            text_width = bbox[2] - bbox[0]
 
         return font
 
@@ -176,116 +291,9 @@ class Display:
         if self.config.get("epd_type") == "epd2in13_V2" and img.size == (120, 250):
             padded = Image.new('1', (122, 250), 1)
             padded.paste(img, (1, 0))
+            img.close()
             return padded
         return img
-
-    # ---- Network status with caching ----
-
-    def get_network_info(self) -> Tuple[str, str]:
-        now = time.time()
-        if self._network_cache['timestamp'] + self._network_cache_ttl > now:
-            return self._network_cache['ip'], self._network_cache['ssid']
-
-        ip = self.get_ip_address()
-        ssid = self.get_ssids()
-        self._network_cache = {'ip': ip, 'ssid': ssid, 'timestamp': now}
-        return ip, ssid
-
-    def get_ip_address(self) -> str:
-        try:
-            iface_list = self._as_list(
-                getattr(self.shared_data, "ip_iface_priority", ["wlan0", "eth0"]),
-                default=["wlan0", "eth0"]
-            )
-
-            for iface in iface_list:
-                result = subprocess.run(
-                    ['ip', 'addr', 'show', iface],
-                    capture_output=True, text=True, timeout=2
-                )
-                if result.returncode == 0:
-                    for line in result.stdout.split('\n'):
-                        if 'inet ' in line:
-                            return line.split()[1].split('/')[0]
-
-            return "No IP"
-
-        except Exception as e:
-            logger.error(f"Error getting IP address: {e}")
-            return "Error"
-
-    def get_ssids(self) -> str:
-        try:
-            result = subprocess.run(
-                ['iwgetid', '-r'],
-                capture_output=True, text=True, timeout=2
-            )
-            if result.returncode == 0:
-                return result.stdout.strip() or "No Wi-Fi"
-            return "No Wi-Fi"
-
-        except Exception as e:
-            logger.error(f"Error getting SSID: {e}")
-            return "Error"
-
-    def check_all_connections(self) -> Dict[str, bool]:
-        now = time.time()
-
-        if self._connection_cache['data'] and (now - self._connection_cache['timestamp']) < self._connection_cache_ttl:
-            return self._connection_cache['data']
-
-        results = {}
-
-        try:
-            ip_neigh = subprocess.run(['ip', 'neigh', 'show'],
-                                      capture_output=True, text=True, timeout=2)
-            neigh_output = ip_neigh.stdout if ip_neigh.returncode == 0 else ""
-
-            iwgetid = subprocess.run(['iwgetid', '-r'],
-                                     capture_output=True, text=True, timeout=1)
-            results['wifi'] = bool(iwgetid.returncode == 0 and iwgetid.stdout.strip())
-
-            bt_ifaces = self._as_list(
-                getattr(self.shared_data, "neigh_bluetooth_ifaces", ["pan0", "bnep0"]),
-                default=["pan0", "bnep0"]
-            )
-            results['bluetooth'] = any(f'dev {iface}' in neigh_output for iface in bt_ifaces)
-
-            eth_iface = self._as_str(
-                getattr(self.shared_data, "neigh_ethernet_iface", "eth0"), "eth0"
-            )
-            results['ethernet'] = f'dev {eth_iface}' in neigh_output
-
-            usb_iface = self._as_str(
-                getattr(self.shared_data, "neigh_usb_iface", "usb0"), "usb0"
-            )
-            results['usb'] = f'dev {usb_iface}' in neigh_output
-
-        except Exception as e:
-            logger.error(f"Connection check failed: {e}")
-            results = {'wifi': False, 'bluetooth': False, 'ethernet': False, 'usb': False}
-
-        self._connection_cache = {'data': results, 'timestamp': now}
-        return results
-
-    def is_manual_mode(self) -> bool:
-        return self.shared_data.manual_mode
-
-    def get_data_count(self) -> int:
-        now = time.time()
-
-        if (now - self._data_count_cache['timestamp']) < self._data_count_cache_ttl:
-            return self._data_count_cache['count']
-
-        try:
-            total = sum(
-                len(files) for r, d, files in os.walk(self.shared_data.data_stolen_dir)
-            )
-            self._data_count_cache = {'count': total, 'timestamp': now}
-            return total
-        except Exception as e:
-            logger.error(f"Error counting data files: {e}")
-            return self._data_count_cache.get('count', 0)
 
     def display_startup_ip(self, ip_address: str, ssid: str):
         if not self.epd_enabled:
@@ -312,7 +320,9 @@ class Display:
             draw.rectangle((0, 1, self.shared_data.width - 1, self.shared_data.height - 1), outline=0)
 
             if self.screen_reversed:
-                image = image.transpose(Image.ROTATE_180)
+                rotated = image.transpose(Image.ROTATE_180)
+                image.close()
+                image = rotated
 
             image = self._pad_for_v2(image)
 
@@ -324,107 +334,13 @@ class Display:
 
         except Exception as e:
             logger.error(f"Error displaying startup IP: {e}")
-
-    def schedule_stats_update(self):
-        while not self.shared_data.display_should_exit:
-            try:
-                self.update_stats_from_db()
-                time.sleep(self.shared_data.shared_update_interval)
-            except Exception as e:
-                logger.error(f"Error in stats update: {e}")
-                time.sleep(self.shared_data.shared_update_interval)
-                continue
-
-    def update_stats_from_db(self):
-        """Update statistics with timeout protection"""
-        acquired = self.semaphore.acquire(timeout=self.SEMAPHORE_TIMEOUT)
-        if not acquired:
-            logger.warning("Failed to acquire semaphore for stats update - skipping")
-            return
-
-        try:
-            stats = self.shared_data.db.get_display_stats()
-
-            self.shared_data.port_count = stats.get('total_open_ports', 0)
-            self.shared_data.target_count = stats.get('alive_hosts_count', 0)
-            self.shared_data.network_kb_count = stats.get('all_known_hosts_count', 0)
-            self.shared_data.vuln_count = stats.get('vulnerabilities_count', 0)
-            self.shared_data.cred_count = stats.get('credentials_count', 0)
-            self.shared_data.attacks_count = stats.get('actions_count', 0)
-            self.shared_data.zombie_count = stats.get('zombie_count', 0)
-
-            self.current_ip, self.ssid = self.get_network_info()
-            self.shared_data.data_count = self.get_data_count()
-            self.shared_data.update_stats()
-
-            connections = self.check_all_connections()
-            self.shared_data.wifi_connected = connections['wifi']
-            self.shared_data.usb_active = connections['usb']
-            self.shared_data.bluetooth_active = connections['bluetooth']
-            self.shared_data.ethernet_active = connections['ethernet']
-
-            self.shared_data.manual_mode = self.is_manual_mode()
-            self.manual_mode_txt = "M" if self.shared_data.manual_mode else "A"
-
-            self.show_ip_on_screen = self.shared_data.showiponscreen
-            self.show_ssid_on_screen = self.shared_data.showssidonscreen
-            self.bjorn_name = self.shared_data.bjorn_name
-
-            if self.bjorn_name != self.previous_bjorn_name:
-                self.calculate_font_to_fit()
-                self.previous_bjorn_name = self.bjorn_name
-
-        except Exception as e:
-            logger.error(f"Error updating stats from DB: {e}")
+            if 'image' in locals() and image:
+                try: image.close()
+                except: pass
         finally:
-            self.semaphore.release()
-
-    def update_main_image(self):
-        while not self.shared_data.display_should_exit:
-            try:
-                self.shared_data.update_image_randomizer()
-                if self.shared_data.imagegen:
-                    self.main_image = self.shared_data.imagegen
-                else:
-                    logger.debug("No image generated for current status")
-
-                time.sleep(
-                    random.uniform(
-                        self.shared_data.image_display_delaymin,
-                        self.shared_data.image_display_delaymax
-                    )
-                )
-
-            except Exception as e:
-                logger.error(f"Error in update_main_image: {e}")
-                time.sleep(5)
-
-    def _as_list(self, value: Any, default: Optional[List] = None) -> List:
-        if default is None:
-            default = []
-
-        try:
-            if isinstance(value, list):
-                return value
-            if isinstance(value, str):
-                try:
-                    obj = json.loads(value)
-                    if isinstance(obj, list):
-                        return obj
-                except:
-                    pass
-                return [x.strip() for x in value.split(",") if x.strip()]
-            return list(value) if value is not None else default
-        except:
-            return default
-
-    def _as_str(self, value: Any, default: str = "") -> str:
-        if isinstance(value, str):
-            return value
-        try:
-            return str(value) if value is not None else default
-        except:
-            return default
+            if 'image' in locals() and image:
+                try: image.close()
+                except: pass
 
     def _as_int(self, value: Any, default: int = 0) -> int:
         try:
@@ -444,13 +360,6 @@ class Display:
 
         return self.px(x), self.py(y)
 
-    def display_comment(self, status: str):
-        params = getattr(self.shared_data, "comment_params", {}) or {}
-        comment = self.comment_ai.get_comment(status, params=params)
-        if comment:
-            self.shared_data.bjorn_says = comment
-            self.shared_data.bjorn_status_text = self.shared_data.bjorn_orch_status
-
     def clear_screen(self):
         if self.epd_enabled:
             try:
@@ -465,212 +374,265 @@ class Display:
     # ========================================================================
 
     def run(self):
-        """Main display rendering loop with active watchdog and recovery"""
-        self.manual_mode_txt = ""
+        """Main display loop. Rendering is decoupled from EPD writes."""
+        local_error_backoff = 1.0
 
         try:
             while not self.shared_data.display_should_exit:
-                iteration_start = time.time()
-
                 try:
-                    success = self._execute_display_update_with_timeout()
+                    image = self._render_display()
+                    rotated = None
+                    try:
+                        if self.screen_reversed:
+                            rotated = image.transpose(Image.ROTATE_180)
+                            image.close()
+                            image = rotated
+                            rotated = None
+                        
+                        image = self._pad_for_v2(image)
 
-                    if success:
-                        self.last_successful_update = time.time()
-                        self.consecutive_failures = 0
-                        self.total_updates += 1
-                    else:
-                        self.consecutive_failures += 1
-                        self.failed_updates += 1
-                        logger.warning(f"Display update failed ({self.consecutive_failures} consecutive failures)")
+                        # Keep web screen responsive even when EPD is degraded.
+                        self._save_screenshot(image)
 
-                    # Watchdog & recovery
-                    time_since_success = time.time() - self.last_successful_update
-                    if (self._upd_stuck_since and (time.time() - self._upd_stuck_since) > self.STUCK_RECOVERY_S) \
-                       or self.consecutive_failures >= 3:
-                        logger.error("Watchdog: EPD appears stuck or repeated failures - attempting recovery")
-                        self._attempt_recovery()
+                        if self.epd_enabled:
+                            # Submit transfers ownership to DisplayUpdateController
+                            self.display_controller.submit(image)
+                            image = None # Prevent closure in finally
+                        else:
+                            image.close()
+                            image = None
+                    finally:
+                        if image:
+                            try: image.close()
+                            except: pass
+                        if rotated:
+                            try: rotated.close()
+                            except: pass
 
-                    # Circuit breaker: disable EPD after many failures
-                    if self.epd_enabled and self.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
-                        logger.error("Too many consecutive display failures - disabling EPD (graceful degradation)")
-                        self.epd_enabled = False  # web-only mode until next recovery success
-                        # Do not reference self.shared_data.epd when disabled
+                    self._check_epd_watchdog()
+                    self._publish_display_metrics()
+                    local_error_backoff = 1.0
 
-                    # Health logs (légers)
-                    if self.total_updates % 100 == 0 and self.total_updates > 0:
-                        success_rate = ((self.total_updates - self.failed_updates) / self.total_updates) * 100
-                        try:
-                            fds = len(os.listdir(f"/proc/{os.getpid()}/fd"))
-                        except Exception:
-                            fds = -1
-                        # logger.info(f"Display stats: {self.total_updates} updates, {success_rate:.1f}% success "
-                        #             f"(threads={threading.active_count()}, fds={fds})")
-
-                    # Delay before next update
                     time.sleep(self.shared_data.screen_delay)
-
                 except KeyboardInterrupt:
                     raise
-                except Exception as e:
-                    logger.error(f"Unexpected error in display loop: {e}")
+                except Exception as exc:
+                    logger.error(f"Unexpected error in display loop: {exc}")
                     logger.error(traceback.format_exc())
-                    time.sleep(5)
-
+                    time.sleep(local_error_backoff)
+                    local_error_backoff = min(local_error_backoff * 2.0, 10.0)
         finally:
             self._cleanup_display()
 
-    def _execute_display_update_with_timeout(self) -> bool:
-        """
-        Lance au plus un worker d’update. Si un précédent est encore vivant,
-        on ne relance pas (évite l’empilement).
-        """
-        with self._upd_lock:
-            if self._upd_thread and self._upd_thread.is_alive():
-                logger.warning("Previous EPD update still running; skipping this cycle")
-                # marquer comme potentiellement bloqué
-                if self._upd_stuck_since is None:
-                    self._upd_stuck_since = time.time()
-                return False
+    def _process_epd_frame(self, image: Image.Image) -> bool:
+        """Single-writer EPD update callback used by DisplayUpdateController."""
+        if not self.epd_enabled:
+            return True
 
-            # démarrer un nouveau worker
-            self._upd_thread = threading.Thread(
-                target=self._do_display_update, daemon=True, name="EPDUpdate"
-            )
-            self._upd_thread.start()
-
-        # Attente bornée
-        self._upd_thread.join(timeout=self.LOOP_ITERATION_TIMEOUT)
-        if self._upd_thread.is_alive():
-            logger.error(f"Display update timed out after {self.LOOP_ITERATION_TIMEOUT}s")
-            if self._upd_stuck_since is None:
-                self._upd_stuck_since = time.time()
-            return False
-
-        # terminé
-        self._upd_stuck_since = None
-        return True
-
-    def _do_display_update(self):
-        """Perform the actual display update (single worker)"""
         try:
-            # Full refresh (si activé) AVANT rendu
-            if self.epd_enabled and self.fullrefresh_activated:
+            self._display_frame(image)
+            self.last_successful_update = time.time()
+            self.consecutive_failures = 0
+            self.total_updates += 1
+            return True
+        except Exception as first_error:
+            self.retry_attempts += 1
+            logger.warning(f"EPD update failed, retrying once: {first_error}")
+            time.sleep(min(self.epd_error_backoff, 5.0))
+
+            try:
+                self._display_frame(image)
+                self.last_successful_update = time.time()
+                self.consecutive_failures = 0
+                self.total_updates += 1
+                return True
+            except Exception as second_error:
+                return self._handle_epd_failure(second_error)
+
+    def _display_frame(self, image: Image.Image):
+        with self._epd_mode_lock:
+            if self.fullrefresh_activated:
                 now = time.time()
                 if now - self._last_full_refresh >= self.fullrefresh_delay:
-                    try:
-                        self.shared_data.epd.clear()
-                        logger.info("Display cleared for full refresh (in worker)")
-                        self._last_full_refresh = now
-                    except Exception as e:
-                        logger.error(f"Full refresh failed: {e}")
-                        # On continue en essayant l’update partiel
+                    self.shared_data.epd.clear()
+                    self._last_full_refresh = now
+                    self._partial_mode_ready = False
+                    logger.info("Display full refresh completed")
 
-            if self.epd_enabled:
-                # Init du mode partiel
-                try:
-                    self.shared_data.epd.init_partial_update()
-                except Exception as e:
-                    logger.error(f"EPD init_partial_update failed: {e}")
-                    raise
+            if not self._partial_mode_ready:
+                self.shared_data.epd.init_partial_update()
+                self._partial_mode_ready = True
 
-            self.display_comment(self.shared_data.bjorn_orch_status)
+            self.shared_data.epd.display_partial(image)
+            if self.shared_data.double_partial_refresh:
+                # Keep this behavior intentionally for ghosting mitigation.
+                self.shared_data.epd.display_partial(image)
 
-            image = self._render_display()
+    def _handle_epd_failure(self, error: Exception) -> bool:
+        self.failed_updates += 1
+        self.consecutive_failures += 1
+        logger.error(f"EPD update failed after retry: {error}")
 
-            if self.screen_reversed:
-                image = image.transpose(Image.ROTATE_180)
+        reinit_ok = self._safe_reinit_epd()
+        if reinit_ok:
+            logger.warning("EPD reinitialized after update failure")
+            return False
 
-            image = self._pad_for_v2(image)
+        if self.consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+            self._enter_headless_mode("too many consecutive EPD failures")
 
-            if self.epd_enabled:
-                try:
-                    self.shared_data.epd.display_partial(image)
-                    if self.shared_data.double_partial_refresh:
-                        self.shared_data.epd.display_partial(image)
-                except Exception as e:
-                    logger.error(f"EPD display_partial failed: {e}")
-                    raise
+        return False
 
-            # Toujours sauver le screenshot (web)
-            self._save_screenshot(image)
+    def _safe_reinit_epd(self) -> bool:
+        now = time.time()
+        if (now - self.last_recovery_attempt) < self.RECOVERY_COOLDOWN:
+            remaining = self.RECOVERY_COOLDOWN - (now - self.last_recovery_attempt)
+            logger.warning_throttled(
+                f"EPD recovery cooldown active ({remaining:.1f}s remaining)",
+                key="display_epd_recovery_cooldown",
+                interval_s=10.0,
+            )
+            return False
 
-            # logger.debug("Display update completed successfully")
+        with self._recovery_lock:
+            now = time.time()
+            if (now - self.last_recovery_attempt) < self.RECOVERY_COOLDOWN:
+                return False
 
-        except Exception as e:
-            logger.error(f"Error in display update: {e}")
-            logger.error(traceback.format_exc())
-            # laisser l’exception remonter pour le comptage des échecs
-            raise
+            self.last_recovery_attempt = now
+            self.reinit_attempts += 1
+            self._recovery_in_progress = True
 
-    def _attempt_recovery(self):
-        """Attempt to recover from display failures"""
-        current_time = time.time()
+            try:
+                self.shared_data.epd.hard_reset()
+                self.shared_data.epd.init_full_update()
+                self._partial_mode_ready = False
+                self.consecutive_failures = 0
+                return True
+            except Exception as recovery_error:
+                logger.error(f"EPD reinit failed: {recovery_error}")
+                return False
+            finally:
+                self._recovery_in_progress = False
 
-        # Enforce cooldown between recovery attempts
-        if current_time - self.last_recovery_attempt < self.RECOVERY_COOLDOWN:
-            time_remaining = self.RECOVERY_COOLDOWN - (current_time - self.last_recovery_attempt)
-            logger.warning(f"Recovery cooldown active ({time_remaining:.1f}s remaining)")
+    def _enter_headless_mode(self, reason: str):
+        if not self.epd_enabled:
+            return
+        self.epd_enabled = False
+        self.headless_reason = reason
+        logger.critical(f"EPD disabled (headless mode): {reason}")
+
+    def _check_epd_watchdog(self):
+        if not self.epd_enabled:
             return
 
-        self.last_recovery_attempt = current_time
-        logger.warning("=== Attempting display recovery ===")
+        metrics = self.display_controller.get_metrics()
+        busy_for_s = float(metrics.get("busy_for_s") or 0.0)
+        if busy_for_s <= self.epd_watchdog_timeout:
+            return
 
+        self.watchdog_stuck_count += 1
+        logger.error_throttled(
+            f"EPD watchdog: update busy for {busy_for_s:.1f}s (threshold={self.epd_watchdog_timeout}s)",
+            key="display_epd_watchdog",
+            interval_s=10.0,
+        )
+        self._attempt_watchdog_recovery()
+
+    def _attempt_watchdog_recovery(self):
+        now = time.time()
+        if (now - self.last_recovery_attempt) < self.RECOVERY_COOLDOWN:
+            return
+
+        if self._recovery_in_progress:
+            return
+
+        self.last_recovery_attempt = now
+        self._recovery_in_progress = True
+
+        def _recover():
+            try:
+                # [infinition] Force reset to break any deadlocks if the main thread is stuck
+                logger.warning("[infinition] EPD Watchdog: Freeze detected. Initiating FORCED RESET to break potential deadlocks.")
+                self.shared_data.epd.hard_reset(force=True)
+                self.shared_data.epd.init_full_update()
+                self._partial_mode_ready = False
+                self.consecutive_failures = 0
+                logger.warning("EPD watchdog recovery completed")
+            except Exception as exc:
+                logger.error(f"EPD watchdog recovery failed: {exc}")
+                self._enter_headless_mode("watchdog recovery failed")
+            finally:
+                self._recovery_in_progress = False
+
+        recovery_thread = threading.Thread(target=_recover, daemon=True, name="EPDWatchdogRecovery")
+        recovery_thread.start()
+        recovery_thread.join(timeout=10.0)
+        if recovery_thread.is_alive():
+            self._recovery_in_progress = False
+            self._enter_headless_mode("watchdog recovery timed out")
+
+    def _publish_display_metrics(self):
+        controller_metrics = self.display_controller.get_metrics()
+        epd_manager_metrics = {}
         try:
-            if self.epd_enabled:
-                # Try hard reset with timeout
-                logger.info("Performing EPD hard reset...")
-                reset_thread = threading.Thread(
-                    target=self.shared_data.epd.hard_reset,
-                    daemon=True
-                )
-                reset_thread.start()
-                reset_thread.join(timeout=15.0)
+            if hasattr(self.shared_data, "epd") and hasattr(self.shared_data.epd, "check_health"):
+                epd_manager_metrics = self.shared_data.epd.check_health()
+        except Exception as exc:
+            epd_manager_metrics = {"error": str(exc)}
 
-                if reset_thread.is_alive():
-                    logger.error("Hard reset timed out - recovery failed")
-                else:
-                    logger.info("Hard reset completed")
-                    self.consecutive_failures = 0
-                    time.sleep(2)  # Let hardware stabilize
-            else:
-                # Si EPD désactivé, tenter une réactivation soft
-                try:
-                    self.shared_data.epd.init_full_update()
-                    self.epd_enabled = True
-                    logger.info("EPD re-enabled after recovery attempt")
-                    self.consecutive_failures = 0
-                except Exception as e:
-                    logger.error(f"Re-enable EPD failed: {e}")
-
-        except Exception as e:
-            logger.error(f"Recovery failed: {e}")
-            logger.error(traceback.format_exc())
+        metrics = {
+            "epd_enabled": int(bool(self.epd_enabled)),
+            "headless": int(not bool(self.epd_enabled)),
+            "headless_reason": self.headless_reason,
+            "total_updates": int(self.total_updates),
+            "failed_updates": int(self.failed_updates),
+            "consecutive_failures": int(self.consecutive_failures),
+            "retry_attempts": int(self.retry_attempts),
+            "reinit_attempts": int(self.reinit_attempts),
+            "watchdog_stuck_count": int(self.watchdog_stuck_count),
+            "last_success_epoch": float(self.last_successful_update),
+            "controller": controller_metrics,
+            "epd_manager": epd_manager_metrics,
+        }
+        with self.shared_data.health_lock:
+            self.shared_data.display_runtime_metrics = metrics
 
     def _render_display(self) -> Image.Image:
         """Render complete display image"""
+        self.bjorn_name = getattr(self.shared_data, "bjorn_name", self.bjorn_name)
+        if self.bjorn_name != self.previous_bjorn_name:
+            self.calculate_font_to_fit()
+            self.previous_bjorn_name = self.bjorn_name
+
         image = Image.new('1', (self.shared_data.width, self.shared_data.height), 255)
-        draw = ImageDraw.Draw(image)
+        try:
+            draw = ImageDraw.Draw(image)
 
-        draw.text((self.px(37), self.py(5)), self.bjorn_name, font=self.font_to_use, fill=0)
-        draw.text((self.px(105), self.py(171)), self.manual_mode_txt, font=self.shared_data.font_arial14, fill=0)
+            draw.text((self.px(37), self.py(5)), self.bjorn_name, font=self.font_to_use, fill=0)
 
-        self._draw_connection_icons(image)
-        self._draw_battery_status(image)
-        self._draw_statistics(image, draw)
+            self._draw_connection_icons(image)
+            self._draw_battery_status(image)
+            self._draw_statistics(image, draw)
+            self._draw_system_histogram(image, draw)
 
-        self.shared_data.update_bjorn_status()
-        image.paste(self.shared_data.bjorn_status_image, (self.px(3), self.py(60)))
+            status_img = self.shared_data.bjorn_status_image or self.shared_data.attack
+            if status_img is not None:
+                image.paste(status_img, (self.px(3), self.py(52)))
 
-        self._draw_status_text(draw)
-        self._draw_decorations(image, draw)
-        self._draw_comment_text(draw)
+            self._draw_status_text(draw)
+            self._draw_decorations(image, draw)
+            self._draw_comment_text(draw)
 
-        if hasattr(self, "main_image") and self.main_image is not None:
-            self.shared_data.bjorn_character = self.main_image
-            image.paste(self.main_image, (self.shared_data.x_center1, self.shared_data.y_bottom1 - 1))
+            main_img = getattr(self.shared_data, "bjorn_character", None)
+            if main_img is not None:
+                image.paste(main_img, (self.shared_data.x_center1, self.shared_data.y_bottom1))
 
-        return image
+            return image
+        except Exception:
+            if image:
+                image.close()
+            raise
 
     def _draw_connection_icons(self, image: Image.Image):
         wifi_width = self.px(16)
@@ -720,58 +682,306 @@ class Display:
                     image.paste(icon, battery_pos)
                     break
 
+    def _draw_system_histogram(self, image: Image.Image, draw: ImageDraw.Draw):
+        # Vertical bars at the bottom-left
+        # Screen W: 122, Character W: 78 -> Character X: 22
+        # Available Left: 0-21.
+        # Margins: Left 2px (0,1), Right 1px (21)
+        # RAM: x=2-10 (9px)
+        # Gap: 11 (1px)
+        # CPU: x=12-20 (9px)
+        
+        # Bottom of screen is 249. User requested 1px up -> 248.
+        # Font 9 height approx 9-10px. 
+        # Label now has NO box and 1px gap.
+        # Label Y: 248 - 9 (height) = 239.
+        # Gap: 1px -> 238 empty.
+        # Bar Base Y: 237.
+        
+        label_h = self.py(9) # Approx height for font 9
+        label_y = self.py(239)
+        base_y = self.py(237) # 1px gap above label
+        max_h = self.py(33) # Remaining height (237 - 204 = 33)
+        
+        # RAM
+        ram_pct = max(0, min(100, self.shared_data.system_mem))
+        ram_h = int((ram_pct / 100.0) * max_h)
+        # Bar background (x=2 to x=10 inclusive)
+        draw.rectangle([self.px(2), base_y - max_h, self.px(10), base_y], outline=0)
+        # Fill
+        draw.rectangle([self.px(2), base_y - ram_h, self.px(10), base_y], fill=0)
+        
+        # Label 'M' - No Box, just text
+        draw.text((self.px(3), label_y), "M", font=self.shared_data.font_arial9, fill=0)
+
+        # CPU 
+        cpu_pct = max(0, min(100, self.shared_data.system_cpu))
+        cpu_h = int((cpu_pct / 100.0) * max_h)
+        # Bar background (x=12 to x=20 inclusive)
+        draw.rectangle([self.px(12), base_y - max_h, self.px(20), base_y], outline=0)
+        # Fill
+        draw.rectangle([self.px(12), base_y - cpu_h, self.px(20), base_y], fill=0)
+        
+        # Label 'C' - No Box
+        draw.text((self.px(13), label_y), "C", font=self.shared_data.font_arial9, fill=0)
+
+    def _format_count(self, val):
+        try:
+            v = int(val)
+            if v >= 1000:
+                return f"{v/1000:.1f}K".replace(".0K", "K")
+            return str(v)
+        except:
+            return str(val)
+
     def _draw_statistics(self, image: Image.Image, draw: ImageDraw.Draw):
         stats = [
-            (self.shared_data.target, (self.px(8), self.py(22)),
-             (self.px(28), self.py(22)), str(self.shared_data.target_count)),
-            (self.shared_data.port, (self.px(47), self.py(22)),
-             (self.px(67), self.py(22)), str(self.shared_data.port_count)),
-            (self.shared_data.vuln, (self.px(86), self.py(22)),
-             (self.px(106), self.py(22)), str(self.shared_data.vuln_count)),
-            (self.shared_data.cred, (self.px(8), self.py(41)),
-             (self.px(28), self.py(41)), str(self.shared_data.cred_count)),
-            (self.shared_data.money, (self.px(3), self.py(172)),
-             (self.px(3), self.py(192)), str(self.shared_data.coin_count)),
-            (self.shared_data.level, (self.px(2), self.py(217)),
-             (self.px(4), self.py(237)), str(self.shared_data.level_count)),
-            (self.shared_data.zombie, (self.px(47), self.py(41)),
-             (self.px(67), self.py(41)), str(self.shared_data.zombie_count)),
-            (self.shared_data.networkkb, (self.px(102), self.py(190)),
-             (self.px(102), self.py(208)), str(self.shared_data.network_kb_count)),
-            (self.shared_data.data, (self.px(86), self.py(41)),
-             (self.px(106), self.py(41)), str(self.shared_data.data_count)),
-            (self.shared_data.attacks, (self.px(100), self.py(218)),
-             (self.px(102), self.py(237)), str(self.shared_data.attacks_count)),
+            # Row 1 (Icons at y=22, Text at y=39)
+            # Target
+            (self.shared_data.target, (self.px(2), self.py(22)),
+             (self.px(2), self.py(39)), self._format_count(self.shared_data.target_count)),
+            # Port
+            (self.shared_data.port, (self.px(22), self.py(22)),
+             (self.px(22), self.py(39)), self._format_count(self.shared_data.port_count)),
+            # Vuln
+            (self.shared_data.vuln, (self.px(42), self.py(22)),
+             (self.px(42), self.py(39)), self._format_count(self.shared_data.vuln_count)),
+            # Cred
+            (self.shared_data.cred, (self.px(62), self.py(22)),
+             (self.px(62), self.py(39)), self._format_count(self.shared_data.cred_count)),
+            # Zombie
+            (self.shared_data.zombie, (self.px(82), self.py(22)),
+             (self.px(82), self.py(39)), self._format_count(self.shared_data.zombie_count)),
+            # Data
+            (self.shared_data.data, (self.px(102), self.py(22)),
+             (self.px(102), self.py(39)), self._format_count(self.shared_data.data_count)),
+            
+            # LVL Widget (Top-Left of bottom frame)
+            # Frame Line at y=170. Gap 1px -> Start y=172. Left Gap 1px -> Start x=2.
+            # Small Square for Value. 
+            # I'll use a 18x18 box.
+            
+            # --- Network KB / Attacks WIDGET (Right)---
+            # Moved to dedicated drawing logic below for box alignment
         ]
 
         for img, img_pos, text_pos, text in stats:
             if img is not None:
                 image.paste(img, img_pos)
-            draw.text(text_pos, text, font=self.shared_data.font_arial9, fill=0)
+                # Dynamic centering
+                try:
+                    # Center text relative to image center
+                    center_x = img_pos[0] + (img.width // 2)
+                    text_w = draw.textlength(text, font=self.shared_data.font_arial9)
+                    new_x = int(center_x - (text_w / 2))
+                    draw.text((new_x, text_pos[1]), text, font=self.shared_data.font_arial9, fill=0)
+                except Exception:
+                    # Fallback
+                    draw.text(text_pos, text, font=self.shared_data.font_arial9, fill=0)
+            else:
+                draw.text(text_pos, text, font=self.shared_data.font_arial9, fill=0)
+        
+        # Draw LVL Box manually to ensure perfect positioning
+        # Box: x=2, y=172. 
+        # User requested "LVL" above value -> Rectangle.
+        # Height increased to fit both (approx 26px).
+        lvl_x = self.px(2)
+        lvl_y = self.py(172)
+        lvl_w = self.px(18)
+        lvl_h = self.py(26) 
+        
+        draw.rectangle([lvl_x, lvl_y, lvl_x + lvl_w, lvl_y + lvl_h], outline=0)
+        
+        # 1. "LVL" Label at top - centered
+        label_txt = "LVL"
+        # Font 7
+        label_font = self.shared_data.font_arial7
+        l_bbox = label_font.getbbox(label_txt)
+        l_w = l_bbox[2] - l_bbox[0]
+        l_x = lvl_x + (lvl_w - l_w) // 2
+        l_y = lvl_y + 1 # Top padding
+        draw.text((l_x, l_y), label_txt, font=label_font, fill=0)
+        
+        # 2. Value below label - centered
+        lvl_val = str(self.shared_data.level_count)
+        val_font = self.shared_data.font_arial9
+        v_bbox = val_font.getbbox(lvl_val)
+        v_w = v_bbox[2] - v_bbox[0]
+        v_x = lvl_x + (lvl_w - v_w) // 2
+        # Position below label (approx y+10)
+        v_y = lvl_y + 10 
+        draw.text((v_x, v_y), lvl_val, font=val_font, fill=0)
+
+        # --- Right Side Widgets (Integrated with Frame) ---
+        # Existing Frame: Top line at y=170. Right edge at x=121. Bottom at y=249.
+        # We only need to draw the Left Vertical separator and Internal Horizontal separators.
+        
+        # Column: x=101 to x=121 (Width 20px).
+        # Height: y=170 to y=249 (Total 79px).
+        
+        col_x_start = self.px(101)
+        col_x_end = self.px(121) # Implicit right edge, useful for centering
+        col_w = self.px(20)
+        
+        y_top = self.py(170)
+        y_bottom = self.py(249)
+        
+        # 1. Draw Left Vertical Divider
+        draw.line([col_x_start, y_top, col_x_start, y_bottom], fill=0)
+        
+        # Section Heights
+        # A/M: Small top section. 15px high.
+        h_am = self.px(15)
+        # Remaining: 79 - 15 = 64px. Split evenly: 32px each.
+        h_net = self.px(32)
+        h_att = self.py(32)
+        
+        # Separator Y positions
+        y_sep1 = y_top + h_am
+        y_sep2 = y_sep1 + h_net
+        
+        # Draw Horizontal Separators (inside the column)
+        draw.line([col_x_start, y_sep1, col_x_end, y_sep1], fill=0)
+        draw.line([col_x_start, y_sep2, col_x_end, y_sep2], fill=0)
+        
+        # --- Section 1: A/M (Top) ---
+        # Center A/M text in y_top to y_sep1
+        # --- Section 1: A/M/AI (Top) ---
+        mode_str = self.shared_data.operation_mode
+        # Map to display text: MANUAL -> M, AUTO -> A, AI -> AI
+        if mode_str == "MANUAL":
+            mode_txt = "M"
+        elif mode_str == "AI":
+            mode_txt = "AI"
+        else:
+            mode_txt = "A"
+
+        # Use slightly smaller font for "AI" if needed, or keep same
+        mode_font = self.shared_data.font_arial11
+        m_bbox = mode_font.getbbox(mode_txt)
+        
+        m_w = m_bbox[2] - m_bbox[0] # Largeur visuelle exacte
+        m_h = m_bbox[3] - m_bbox[1] # Hauteur visuelle exacte
+        
+        # MODIFICATION ICI (Horizontal) :
+        m_x = col_x_start + (col_w - m_w) // 2 - m_bbox[0]
+        
+        # MODIFICATION ICI (Vertical) :
+        m_y = y_top + (h_am - m_h) // 2 - m_bbox[1]
+        
+        draw.text((m_x, m_y), mode_txt, font=mode_font, fill=0)
+        
+        # --- Section 2: Network KB (Middle) ---
+        # Center in y_sep1 to y_sep2 (32px high)
+        net_y_start = y_sep1
+        
+        # Icon
+        if self.shared_data.networkkb:
+            icon = self.shared_data.networkkb
+            ix = col_x_start + (col_w - icon.width) // 2
+            # Center icon somewhat? Or fixed top padding?
+            # 32px height. Icon ~15px. Text ~7px. Total content ~23px.
+            # Margin = (32 - 23) / 2 = ~4px.
+            iy = net_y_start + 3
+            image.paste(icon, (ix, iy))
+            text_y_start = iy + icon.height
+        else:
+            text_y_start = net_y_start + 9
+
+        # Value
+        net_val = self._format_count(self.shared_data.network_kb_count)
+        n_font = self.shared_data.font_arial10
+        n_bbox = n_font.getbbox(net_val)
+        n_w = n_bbox[2] - n_bbox[0]
+        nx = col_x_start + (col_w - n_w) // 2
+        draw.text((nx, text_y_start), net_val, font=n_font, fill=0)
+        
+        # --- Section 3: Attacks (Bottom) ---
+        # Center in y_sep2 to y_bottom (32px high)
+        att_y_start = y_sep2
+        
+        # Icon
+        if self.shared_data.attacks:
+            icon = self.shared_data.attacks
+            ix = col_x_start + (col_w - icon.width) // 2
+            iy = att_y_start + 3 # Same padding as above
+            image.paste(icon, (ix, iy))
+            text_y_start = iy + icon.height
+        else:
+            text_y_start = att_y_start + 9
+            
+        # Value
+        att_val = self._format_count(self.shared_data.attacks_count)
+        a_bbox = n_font.getbbox(att_val)
+        a_w = a_bbox[2] - a_bbox[0]
+        ax = col_x_start + (col_w - a_w) // 2
+        draw.text((ax, text_y_start), att_val, font=n_font, fill=0)
+
 
     def _draw_status_text(self, draw: ImageDraw.Draw):
-        if self.show_ip_on_screen:
-            draw.text((self.px(35), self.py(60)), self.current_ip,
+        # Determine progress value (0-100)
+        try:
+            progress_str = self.shared_data.bjorn_progress.replace("%", "").strip()
+            progress_val = int(progress_str)
+        except:
+            progress_val = 0
+            
+        # Draw Progress Bar (y=75-80) - Moved up & narrower to fit text
+        bar_x = self.px(35)
+        bar_y = self.py(75)
+        bar_w = self.px(55) # Reduced to 55px to fit text "100%"
+        bar_h = self.py(5)
+        
+        if progress_val > 0:
+            # Standard Progress Bar
+            draw.rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], outline=0)
+            fill_w = int((progress_val / 100.0) * bar_w)
+            if fill_w > 0:
+                draw.rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], fill=0)
+
+            # Draw Percentage Text at the end
+            # x = bar_x + bar_w + 3
+            # y = centered with bar (bar y=75, h=5 -> center 77.5)
+            # Font 9 height ~9-10px. y_text ~ 73 ?
+            text_x = bar_x + bar_w + self.px(4)
+            text_y = bar_y - 2 # Align visually with bar
+            draw.text((text_x, text_y), f"{progress_val}%", font=self.shared_data.font_arial9, fill=0)
+
+        current_ip = getattr(self.shared_data, "current_ip", "No IP")
+        action_target_ip = str(getattr(self.shared_data, "action_target_ip", "") or "").strip()
+        orch_status = str(getattr(self.shared_data, "bjorn_orch_status", "IDLE") or "IDLE").upper()
+        show_ip = bool(getattr(self.shared_data, "showiponscreen", False))
+        if show_ip:
+            # Show local IP only while idle; during actions show target IP when available.
+            if orch_status == "IDLE":
+                ip_to_show = current_ip
+            else:
+                ip_to_show = action_target_ip or current_ip
+
+            draw.text((self.px(35), self.py(52)), ip_to_show,
                       font=self.shared_data.font_arial9, fill=0)
-            draw.text((self.px(35), self.py(69)), self.shared_data.bjorn_status_text,
+            draw.text((self.px(35), self.py(61)), self.shared_data.bjorn_status_text,
                       font=self.shared_data.font_arial9, fill=0)
-            draw.text((self.px(35), self.py(78)), self.shared_data.bjorn_status_text2,
-                      font=self.shared_data.font_arial9, fill=0)
-            draw.text((self.px(102), self.py(78)), self.shared_data.bjorn_progress,
-                      font=self.shared_data.font_arial9, fill=0)
-            draw.line((1, self.py(89), self.shared_data.width - 1, self.py(89)), fill=0)
+            # Line at y=85 (moved up 3px)
+            draw.line((1, self.py(85), self.shared_data.width - 1, self.py(85)), fill=0)
         else:
-            draw.text((self.px(35), self.py(65)), self.shared_data.bjorn_status_text,
+            draw.text((self.px(35), self.py(55)), self.shared_data.bjorn_status_text,
                       font=self.shared_data.font_arial9, fill=0)
-            draw.text((self.px(35), self.py(75)), self.shared_data.bjorn_status_text2,
+            draw.text((self.px(35), self.py(66)), self.shared_data.bjorn_status_text2,
                       font=self.shared_data.font_arial9, fill=0)
-            draw.text((self.px(102), self.py(75)), self.shared_data.bjorn_progress,
-                      font=self.shared_data.font_arial9, fill=0)
-            draw.line((1, self.py(87), self.shared_data.width - 1, self.py(87)), fill=0)
+            # Line at y=85 (moved up 3px)
+            draw.line((1, self.py(85), self.shared_data.width - 1, self.py(85)), fill=0)
 
     def _draw_decorations(self, image: Image.Image, draw: ImageDraw.Draw):
-        if self.show_ssid_on_screen:
-            draw.text((self.px(3), self.py(160)), self.ssid,
+        show_ssid = bool(getattr(self.shared_data, "showssidonscreen", False))
+        if show_ssid:
+            # Center SSID
+            ssid = getattr(self.shared_data, "current_ssid", "No Wi-Fi")
+            ssid_w = draw.textlength(ssid, font=self.shared_data.font_arial9)
+            center_x = self.shared_data.width // 2
+            ssid_x = int(center_x - (ssid_w / 2))
+            
+            draw.text((ssid_x, self.py(160)), ssid,
                       font=self.shared_data.font_arial9, fill=0)
             draw.line((0, self.py(170), self.shared_data.width, self.py(170)), fill=0)
         else:
@@ -781,64 +991,99 @@ class Display:
 
         draw.rectangle((0, 0, self.shared_data.width - 1, self.shared_data.height - 1), outline=0)
         draw.line((0, self.py(20), self.shared_data.width, self.py(20)), fill=0)
-        draw.line((0, self.py(59), self.shared_data.width, self.py(59)), fill=0)
+        draw.line((0, self.py(51), self.shared_data.width, self.py(51)), fill=0)
 
     def _draw_comment_text(self, draw: ImageDraw.Draw):
-        # Cache key for the layout
-        key = (self.shared_data.bjorn_says, self.shared_data.width, id(self.shared_data.font_arialbold))
-        now = time.time()
-        if (
-            self._comment_layout_cache["key"] != key or
-            (now - self._comment_layout_cache["ts"]) >= self._comment_layout_min_interval
-        ):
-            lines = self.shared_data.wrap_text(
-                self.shared_data.bjorn_says,
-                self.shared_data.font_arialbold,
-                self.shared_data.width - 4
-            )
-            self._comment_layout_cache = {"key": key, "lines": lines, "ts": now}
-        else:
-            lines = self._comment_layout_cache["lines"]
+            # Cache key for the layout
+            key = (self.shared_data.bjorn_says, self.shared_data.width, id(self.shared_data.font_arialbold))
+            now = time.time()
+            if (
+                self._comment_layout_cache["key"] != key or
+                (now - self._comment_layout_cache["ts"]) >= self._comment_layout_min_interval
+            ):
+                # J'ai aussi augmenté la largeur disponible (width - 2) puisque l'on se colle au bord
+                lines = self.shared_data.wrap_text(
+                    self.shared_data.bjorn_says,
+                    self.shared_data.font_arialbold,
+                    self.shared_data.width - 2 
+                )
+                self._comment_layout_cache = {"key": key, "lines": lines, "ts": now}
+            else:
+                lines = self._comment_layout_cache["lines"]
 
-        y_text = self.py(92)
-        font = self.shared_data.font_arialbold
-        bbox = font.getbbox('Aj')
-        font_height = (bbox[3] - bbox[1]) if bbox else font.size
+            # MODIFICATION ICI :
+            # La ligne du dessus est à self.py(85). On veut 1px d'écart, donc 85 + 1 = 86.
+            y_text = self.py(86) 
+            
+            font = self.shared_data.font_arialbold
+            bbox = font.getbbox('Aj')
+            font_height = (bbox[3] - bbox[1]) if bbox else font.size
 
-        for line in lines:
-            draw.text((self.px(4), y_text), line,
-                      font=font, fill=0)
-            y_text += font_height + self.shared_data.line_spacing
+            for line in lines:
+                # MODIFICATION ICI : self.px(1) au lieu de self.px(4)
+                draw.text((self.px(1), y_text), line,
+                        font=font, fill=0)
+                y_text += font_height + self.shared_data.line_spacing
 
     def _save_screenshot(self, image: Image.Image):
-        try:
-            out_img = image
-            if self.web_screen_reversed:
-                out_img = out_img.transpose(Image.ROTATE_180)
+            # 1. Throttling : Only capture every 4 seconds to save CPU/IO
+            now = time.time()
+            if not hasattr(self, "_last_screenshot_time"):
+                self._last_screenshot_time = 0
 
-            screenshot_path = os.path.join(self.shared_data.web_dir, "screen.png")
-            with open(screenshot_path, 'wb') as img_file:
-                out_img.save(img_file)
-                img_file.flush()
-                os.fsync(img_file.fileno())
+            if now - self._last_screenshot_time < self._screenshot_interval_s:
+                return
+            self._last_screenshot_time = now
 
-        except Exception as e:
-            logger.error(f"Error saving screenshot: {e}")
+            rotated = None
+            try:
+                out_img = image
+                if self.web_screen_reversed:
+                    rotated = out_img.transpose(Image.ROTATE_180)
+                    out_img = rotated
+
+                screenshot_path = os.path.join(self.shared_data.web_dir, "screen.png")
+                tmp_path = f"{screenshot_path}.tmp"
+
+                # 2. Optimization : compress_level=1 (much faster on CPU)
+                out_img.save(tmp_path, format="PNG", compress_level=1)
+                os.replace(tmp_path, screenshot_path)
+
+            except Exception as e:
+                logger.error(f"Error saving screenshot: {e}")
+            finally:
+                if rotated is not None:
+                    try:
+                        rotated.close()
+                    except Exception:
+                        pass
 
     def _cleanup_display(self):
+        worker_stopped = True
         try:
-            if self.epd_enabled:
+            worker_stopped = self.display_controller.stop(timeout=2.0)
+            if not worker_stopped:
+                logger.warning("EPD worker still alive during shutdown; skipping blocking EPD cleanup")
+        except Exception as exc:
+            worker_stopped = False
+            logger.warning(f"Display controller stop failed during cleanup: {exc}")
+
+        try:
+            if self.epd_enabled and worker_stopped:
                 self.shared_data.epd.init_full_update()
                 blank_image = Image.new('1', (self.shared_data.width, self.shared_data.height), 255)
                 blank_image = self._pad_for_v2(blank_image)
                 self.shared_data.epd.display_partial(blank_image)
                 if self.shared_data.double_partial_refresh:
                     self.shared_data.epd.display_partial(blank_image)
+                blank_image.close()
                 logger.info("EPD display cleared and device exited")
                 try:
                     self.shared_data.epd.sleep()
                 except Exception:
                     pass
+            elif self.epd_enabled and not worker_stopped:
+                logger.warning("EPD cleanup skipped because worker did not stop in time")
             else:
                 logger.info("Display thread exited (EPD was disabled)")
         except Exception as e:
@@ -859,5 +1104,3 @@ def handle_exit_display(signum, frame, display_thread=None):
                 logger.info("Display thread finished cleanly.")
     except Exception as e:
         logger.error(f"Error while closing the display: {e}")
-
-    sys.exit(0)
