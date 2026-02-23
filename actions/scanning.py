@@ -250,28 +250,44 @@ class NetworkScanner:
     def get_network(self):
         """
         Retrieves the network information including the default gateway and subnet.
-        Uses 'ip route' directly since netifaces2 may not see NetworkManager routes.
+        Prefers wlan0 over other interfaces for scanning.
         """
         try:
-            # Parse 'ip route' for the default route with lowest metric
+            # Parse 'ip route' for default routes, prefer wlan0
             result = subprocess.run(
                 ['ip', '-4', 'route', 'show', 'default'],
                 capture_output=True, text=True, timeout=5
             )
-            best_iface = None
-            best_metric = float('inf')
+            routes = []
             for line in result.stdout.strip().split('\n'):
                 if not line:
                     continue
                 parts = line.split()
                 iface = parts[parts.index('dev') + 1] if 'dev' in parts else None
                 metric = int(parts[parts.index('metric') + 1]) if 'metric' in parts else 0
-                if iface and metric < best_metric:
-                    best_metric = metric
-                    best_iface = iface
+                if iface:
+                    routes.append((iface, metric))
 
-            if not best_iface:
+            if not routes:
+                # Fallback: check wlan0 directly even without default route
+                addr_check = subprocess.run(
+                    ['ip', '-4', '-o', 'addr', 'show', 'wlan0'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if addr_check.stdout.strip():
+                    routes.append(('wlan0', 0))
+
+            if not routes:
                 raise RuntimeError("No default route found")
+
+            # Prefer wlan0 if it has a route
+            best_iface = None
+            for iface, metric in routes:
+                if iface.startswith('wlan'):
+                    best_iface = iface
+                    break
+            if not best_iface:
+                best_iface = min(routes, key=lambda r: r[1])[0]
 
             # Get IP and netmask from the chosen interface
             addr_result = subprocess.run(
