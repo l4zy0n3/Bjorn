@@ -237,7 +237,19 @@ class Display:
     def is_wifi_connected(self):
         """Check if WiFi is connected by checking the current SSID."""
         try:
-            result = subprocess.Popen(['/usr/sbin/iwgetid', '-r'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # Try nmcli first (works reliably on Trixie with NetworkManager)
+            result = subprocess.Popen(
+                ['nmcli', '-t', '-f', 'GENERAL.STATE', 'dev', 'show', 'wlan0'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            stdout, error = result.communicate()
+            if result.returncode == 0 and '100 (connected)' in stdout:
+                return True
+            # Fallback to iwgetid for Bookworm/dhcpcd systems
+            result = subprocess.Popen(
+                ['/usr/sbin/iwgetid', '-r'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
             ssid, error = result.communicate()
             if result.returncode != 0:
                 logger.error(f"Error executing 'iwgetid -r': {error}")

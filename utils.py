@@ -435,11 +435,23 @@ class WebUtils:
                 raise Exception(stderr)
             networks = self.parse_scan_result(stdout)
             self.logger.info(f"Found {len(networks)} networks")
-            current_ssid = subprocess.Popen(['/usr/sbin/iwgetid', '-r'], stdout=subprocess.PIPE, text=True)
-            ssid_out, ssid_err = current_ssid.communicate()
-            if current_ssid.returncode != 0:
-                raise Exception(ssid_err)
-            current_ssid = ssid_out.strip()
+            # Try nmcli first (Trixie), fallback to iwgetid (Bookworm)
+            current_ssid = ""
+            nmcli_result = subprocess.Popen(
+                ['nmcli', '-t', '-f', 'active,ssid', 'dev', 'wifi'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            )
+            nmcli_out, _ = nmcli_result.communicate()
+            if nmcli_result.returncode == 0:
+                for line in nmcli_out.strip().split('\n'):
+                    if line.startswith('yes:'):
+                        current_ssid = line.split(':', 1)[1]
+                        break
+            if not current_ssid:
+                iwgetid = subprocess.Popen(['/usr/sbin/iwgetid', '-r'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                ssid_out, ssid_err = iwgetid.communicate()
+                if iwgetid.returncode == 0:
+                    current_ssid = ssid_out.strip()
             self.logger.info(f"Current SSID: {current_ssid}")
             handler.send_response(200)
             handler.send_header("Content-type", "application/json")

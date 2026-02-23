@@ -96,10 +96,17 @@ class Bjorn:
             logger.info("Orchestrator thread is not running.")
 
     def is_wifi_connected(self):
-        """Checks for Wi-Fi connectivity using the nmcli command."""
-        result = subprocess.Popen(['nmcli', '-t', '-f', 'active', 'dev', 'wifi'], stdout=subprocess.PIPE, text=True).communicate()[0]
-        self.wifi_connected = 'yes' in result
-        return self.wifi_connected
+        """Checks for Wi-Fi connectivity using nmcli device status."""
+        result = subprocess.Popen(
+            ['nmcli', '-t', '-f', 'DEVICE,STATE', 'dev', 'status'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        ).communicate()[0]
+        for line in result.strip().split('\n'):
+            if line.startswith('wlan0:') and 'connected' in line:
+                self.wifi_connected = True
+                return True
+        self.wifi_connected = False
+        return False
 
     
     @staticmethod
