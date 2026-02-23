@@ -7,7 +7,6 @@ import json
 import csv
 import zipfile
 import uuid
-import cgi
 import io
 import importlib
 import logging
@@ -231,13 +230,29 @@ class WebUtils:
         try:
             content_length = int(handler.headers['Content-Length'])
             field_data = handler.rfile.read(content_length)
-            field_storage = cgi.FieldStorage(fp=io.BytesIO(field_data), headers=handler.headers, environ={'REQUEST_METHOD': 'POST'})
+            content_type = handler.headers['Content-Type']
+            boundary = content_type.split('boundary=')[1].encode()
 
-            file_item = field_storage['file']
-            if file_item.filename:
-                backup_path = os.path.join(self.shared_data.upload_dir, file_item.filename)
+            # Parse multipart form data
+            filename = None
+            file_data = None
+            parts = field_data.split(b'--' + boundary)
+            for part in parts:
+                if b'name="file"' in part and b'filename="' in part:
+                    header_end = part.find(b'\r\n\r\n')
+                    header_section = part[:header_end].decode()
+                    file_data = part[header_end + 4:]
+                    if file_data.endswith(b'\r\n'):
+                        file_data = file_data[:-2]
+                    fn_start = header_section.find('filename="') + len('filename="')
+                    fn_end = header_section.find('"', fn_start)
+                    filename = header_section[fn_start:fn_end]
+                    break
+
+            if filename and file_data:
+                backup_path = os.path.join(self.shared_data.upload_dir, filename)
                 with open(backup_path, 'wb') as output_file:
-                    output_file.write(file_item.file.read())
+                    output_file.write(file_data)
 
                 with zipfile.ZipFile(backup_path, 'r') as backup_zip:
                     backup_zip.extractall(self.shared_data.currentdir)
