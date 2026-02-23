@@ -429,13 +429,13 @@ class WebUtils:
 
     def scan_wifi(self, handler):
         try:
-            result = subprocess.Popen(['sudo', 'iwlist', 'wlan0', 'scan'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            result = subprocess.Popen(['sudo', '/usr/sbin/iwlist', 'wlan0', 'scan'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             stdout, stderr = result.communicate()
             if result.returncode != 0:
                 raise Exception(stderr)
             networks = self.parse_scan_result(stdout)
             self.logger.info(f"Found {len(networks)} networks")
-            current_ssid = subprocess.Popen(['iwgetid', '-r'], stdout=subprocess.PIPE, text=True)
+            current_ssid = subprocess.Popen(['/usr/sbin/iwgetid', '-r'], stdout=subprocess.PIPE, text=True)
             ssid_out, ssid_err = current_ssid.communicate()
             if current_ssid.returncode != 0:
                 raise Exception(ssid_err)

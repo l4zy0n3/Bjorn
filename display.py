@@ -237,7 +237,7 @@ class Display:
     def is_wifi_connected(self):
         """Check if WiFi is connected by checking the current SSID."""
         try:
-            result = subprocess.Popen(['iwgetid', '-r'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            result = subprocess.Popen(['/usr/sbin/iwgetid', '-r'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             ssid, error = result.communicate()
             if result.returncode != 0:
                 logger.error(f"Error executing 'iwgetid -r': {error}")
