@@ -249,32 +249,43 @@ class NetworkScanner:
     def get_network(self):
         """
         Retrieves the network information including the default gateway and subnet.
+        Uses 'ip route' directly since netifaces2 may not see NetworkManager routes.
         """
         try:
-            gws = netifaces.gateways()
-            # netifaces2 uses enum keys without 'default'; netifaces uses 'default' key
-            if 'default' in gws and netifaces.AF_INET in gws['default']:
-                default_iface = gws['default'][netifaces.AF_INET][1]
-            elif netifaces.AF_INET in gws:
-                # netifaces2: find the default gateway entry
-                default_iface = None
-                for gw_ip, iface, is_default in gws[netifaces.AF_INET]:
-                    if is_default:
-                        default_iface = iface
-                        break
-                if default_iface is None:
-                    default_iface = gws[netifaces.AF_INET][0][1]
-            else:
-                raise RuntimeError("No IPv4 gateways found")
-            iface = netifaces.ifaddresses(default_iface)[netifaces.AF_INET][0]
-            ip_address = iface['addr']
-            netmask = iface.get('netmask') or iface.get('mask')
-            if not netmask:
-                raise RuntimeError(f"No netmask found for {default_iface}")
-            cidr = sum([bin(int(x)).count('1') for x in netmask.split('.')])
-            network = ipaddress.IPv4Network(f"{ip_address}/{cidr}", strict=False)
-            self.logger.info(f"Network: {network}")
-            return network
+            # Parse 'ip route' for the default route with lowest metric
+            result = subprocess.run(
+                ['ip', '-4', 'route', 'show', 'default'],
+                capture_output=True, text=True, timeout=5
+            )
+            best_iface = None
+            best_metric = float('inf')
+            for line in result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+                parts = line.split()
+                iface = parts[parts.index('dev') + 1] if 'dev' in parts else None
+                metric = int(parts[parts.index('metric') + 1]) if 'metric' in parts else 0
+                if iface and metric < best_metric:
+                    best_metric = metric
+                    best_iface = iface
+
+            if not best_iface:
+                raise RuntimeError("No default route found")
+
+            # Get IP and netmask from the chosen interface
+            addr_result = subprocess.run(
+                ['ip', '-4', '-o', 'addr', 'show', best_iface],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in addr_result.stdout.strip().split('\n'):
+                if 'inet ' in line:
+                    # Format: "N: iface    inet IP/CIDR ..."
+                    inet_part = line.split('inet ')[1].split()[0]
+                    network = ipaddress.IPv4Network(inet_part, strict=False)
+                    self.logger.info(f"Network: {network} (via {best_iface})")
+                    return network
+
+            raise RuntimeError(f"No IPv4 address on {best_iface}")
         except Exception as e:
             self.logger.error(f"Error in get_network: {e}")
 
