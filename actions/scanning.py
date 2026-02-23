@@ -317,13 +317,12 @@ class NetworkScanner:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(2)
             try:
-                con = s.connect((self.target, port))
+                s.connect((self.target, port))
                 self.open_ports[self.target].append(port)
-                con.close()
             except (OSError, socket.timeout):
                 pass
             finally:
-                s.close()  # Ensure the socket is closed
+                s.close()
 
         def start(self):
             """
