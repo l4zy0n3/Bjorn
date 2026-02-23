@@ -134,24 +134,20 @@ check_system_compatibility() {
     if [ -f "/etc/os-release" ]; then
         source /etc/os-release
         
-        # Verify if it's Raspbian
-        if [ "$NAME" != "Raspbian GNU/Linux" ]; then
-            log "WARNING" "Different OS detected. Recommended: Raspbian GNU/Linux, Found: ${NAME}"
-            echo -e "${YELLOW}Your system is not running Raspbian GNU/Linux.${NC}"
+        # Verify if it's Raspbian or Debian (arm64 RPi OS reports as Debian GNU/Linux)
+        if [ "$NAME" != "Raspbian GNU/Linux" ] && [ "$NAME" != "Debian GNU/Linux" ]; then
+            log "WARNING" "Different OS detected. Expected: Raspbian or Debian GNU/Linux, Found: ${NAME}"
+            echo -e "${YELLOW}Your system is not running Raspbian or Debian GNU/Linux.${NC}"
             should_ask_confirmation=true
         fi
         
-        # Compare versions (expecting Bookworm = 12)
-        expected_version="12"
-        if [ "$VERSION_ID" != "$expected_version" ]; then
-            log "WARNING" "Different OS version detected"
-            echo -e "${YELLOW}This script was tested with Raspbian GNU/Linux 12 (bookworm)${NC}"
+        # Compare versions (expecting Bookworm = 12 or newer)
+        min_version="12"
+        if [ "$VERSION_ID" -lt "$min_version" ] 2>/dev/null; then
+            log "WARNING" "OS version too old"
+            echo -e "${YELLOW}This script requires Raspbian GNU/Linux 12 (bookworm) or newer${NC}"
             echo -e "${YELLOW}Current system: ${PRETTY_NAME}${NC}"
-            if [ "$VERSION_ID" -lt "$expected_version" ]; then
-                echo -e "${YELLOW}Your system version ($VERSION_ID) is older than recommended ($expected_version)${NC}"
-            elif [ "$VERSION_ID" -gt "$expected_version" ]; then
-                echo -e "${YELLOW}Your system version ($VERSION_ID) is newer than tested ($expected_version)${NC}"
-            fi
+            echo -e "${YELLOW}Your system version ($VERSION_ID) is older than required ($min_version)${NC}"
             should_ask_confirmation=true
         else
             log "SUCCESS" "OS version check passed: ${PRETTY_NAME}"
@@ -161,11 +157,11 @@ check_system_compatibility() {
         should_ask_confirmation=true
     fi
 
-    # Check if system is 32-bit ARM (armhf)
+    # Check if system is ARM (armhf or arm64)
     architecture=$(dpkg --print-architecture)
-    if [ "$architecture" != "armhf" ]; then
-        log "WARNING" "Different architecture detected. Expected: armhf, Found: ${architecture}"
-        echo -e "${YELLOW}This script was tested with armhf architecture${NC}"
+    if [ "$architecture" != "armhf" ] && [ "$architecture" != "arm64" ]; then
+        log "WARNING" "Different architecture detected. Expected: armhf or arm64, Found: ${architecture}"
+        echo -e "${YELLOW}This script was tested with armhf and arm64 architectures${NC}"
         should_ask_confirmation=true
     fi
     
@@ -215,7 +211,6 @@ install_dependencies() {
         "libopenblas-dev"
         "bluez-tools"
         "bluez"
-        "dhcpcd5"
         "bridge-utils"
         "python3-pil"
         "libjpeg-dev"
@@ -226,7 +221,6 @@ install_dependencies() {
         "libssl-dev"
         "libgpiod-dev"
         "libi2c-dev"
-        "libatlas-base-dev"
         "build-essential"
     )
     
@@ -236,7 +230,16 @@ install_dependencies() {
         apt-get install -y "$package"
         check_success "Installed $package"
     done
-    
+
+    # Install dhcpcd5 if available (not present on Debian Trixie+)
+    if apt-cache show dhcpcd5 >/dev/null 2>&1; then
+        log "INFO" "Installing dhcpcd5..."
+        apt-get install -y dhcpcd5
+        check_success "Installed dhcpcd5"
+    else
+        log "INFO" "dhcpcd5 not available, skipping (systemd-networkd will be used instead)"
+    fi
+
     # Update nmap scripts
     nmap --script-updatedb
     check_success "Dependencies installation completed"
@@ -439,7 +442,8 @@ while ! ls /sys/class/udc > UDC 2>/dev/null; do
 done
 
 if ! ip addr show usb0 | grep -q "172.20.2.1"; then
-    ifconfig usb0 172.20.2.1 netmask 255.255.255.0
+    ip addr add 172.20.2.1/24 dev usb0
+    ip link set usb0 up
 else
     echo "Interface usb0 already configured."
 fi
@@ -463,14 +467,29 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
-    # Configure network interface
-    cat >> /etc/network/interfaces << EOF
+    # Configure network interface for usb0
+    if command -v nmcli >/dev/null 2>&1; then
+        # Trixie+ uses NetworkManager
+        log "INFO" "Configuring usb0 via NetworkManager..."
+        nmcli connection add type ethernet \
+            con-name "usb0-static" \
+            ifname usb0 \
+            ipv4.method manual \
+            ipv4.addresses 172.20.2.1/24 \
+            connection.autoconnect yes 2>/dev/null || true
+    elif [ -f /etc/network/interfaces ]; then
+        # Bookworm uses ifupdown
+        log "INFO" "Configuring usb0 via /etc/network/interfaces..."
+        cat >> /etc/network/interfaces << EOF
 
 allow-hotplug usb0
 iface usb0 inet static
     address 172.20.2.1
     netmask 255.255.255.0
 EOF
+    else
+        log "WARNING" "No supported network manager found for usb0 configuration"
+    fi
 
     # Enable and start services
     systemctl daemon-reload

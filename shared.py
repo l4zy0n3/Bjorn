@@ -248,7 +248,6 @@ class SharedData:
             logger.info("Initializing EPD display...")
             time.sleep(1)
             self.epd_helper = EPDHelper(self.config["epd_type"])
-            self.epd_helper = EPDHelper(self.epd_type)
             if self.config["epd_type"] == "epd2in7":
                 logger.info("EPD type: epd2in7 screen reversed")
                 self.screen_reversed = False

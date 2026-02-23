@@ -22,10 +22,12 @@ import logging
 import random
 import sys
 from PIL import Image, ImageDraw
-from init_shared import shared_data  
+from init_shared import shared_data
 from comment import Commentaireia
 from logger import Logger
-import subprocess  
+import subprocess
+
+_ROTATE_180 = getattr(Image.Transpose, 'ROTATE_180', None) or Image.ROTATE_180
 
 logger = Logger(name="display.py", level=logging.DEBUG)
 
@@ -341,13 +343,12 @@ class Display:
                     y_text += (self.shared_data.font_arialbold.getbbox(line)[3] - self.shared_data.font_arialbold.getbbox(line)[1]) + 3
 
                 if self.screen_reversed:
-                    image = image.transpose(Image.ROTATE_180)
+                    image = image.transpose(_ROTATE_180)
 
-                self.epd_helper.display_partial(image)
                 self.epd_helper.display_partial(image)
 
                 if self.web_screen_reversed:
-                    image = image.transpose(Image.ROTATE_180)
+                    image = image.transpose(_ROTATE_180)
                 with open(os.path.join(self.shared_data.webdir, "screen.png"), 'wb') as img_file:
                     image.save(img_file)
                     img_file.flush()
