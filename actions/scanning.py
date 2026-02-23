@@ -268,7 +268,9 @@ class NetworkScanner:
                 raise RuntimeError("No IPv4 gateways found")
             iface = netifaces.ifaddresses(default_iface)[netifaces.AF_INET][0]
             ip_address = iface['addr']
-            netmask = iface['netmask']
+            netmask = iface.get('netmask') or iface.get('mask')
+            if not netmask:
+                raise RuntimeError(f"No netmask found for {default_iface}")
             cidr = sum([bin(int(x)).count('1') for x in netmask.split('.')])
             network = ipaddress.IPv4Network(f"{ip_address}/{cidr}", strict=False)
             self.logger.info(f"Network: {network}")
