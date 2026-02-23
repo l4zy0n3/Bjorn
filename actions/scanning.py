@@ -252,8 +252,21 @@ class NetworkScanner:
         """
         try:
             gws = netifaces.gateways()
-            default_gateway = gws['default'][netifaces.AF_INET][1]
-            iface = netifaces.ifaddresses(default_gateway)[netifaces.AF_INET][0]
+            # netifaces2 uses enum keys without 'default'; netifaces uses 'default' key
+            if 'default' in gws and netifaces.AF_INET in gws['default']:
+                default_iface = gws['default'][netifaces.AF_INET][1]
+            elif netifaces.AF_INET in gws:
+                # netifaces2: find the default gateway entry
+                default_iface = None
+                for gw_ip, iface, is_default in gws[netifaces.AF_INET]:
+                    if is_default:
+                        default_iface = iface
+                        break
+                if default_iface is None:
+                    default_iface = gws[netifaces.AF_INET][0][1]
+            else:
+                raise RuntimeError("No IPv4 gateways found")
+            iface = netifaces.ifaddresses(default_iface)[netifaces.AF_INET][0]
             ip_address = iface['addr']
             netmask = iface['netmask']
             cidr = sum([bin(int(x)).count('1') for x in netmask.split('.')])
